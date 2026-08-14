@@ -1015,10 +1015,13 @@ void VocalAnalyzer::deriveSettings (AnalysisResult& r)
 
     // Depth follows how much noise there actually is. A clean-ish take gets a
     // token amount of downward expansion, not a hard gate.
-    // Depth has to cover the room as well as the hiss: on a live booth the
-    // thing being pulled down between words is reverb, not noise.
-    r.gateRangeDb   = -std::clamp (std::max ((40.0f - r.snrDb) * 0.6f,
-                                             r.reverbRatio * 18.0f), 3.0f, 24.0f);
+    // Depth covers the room as well as the hiss, but capped well short of a
+    // hard gate. Measured per-stage, the expander was the single largest source
+    // of frame-to-frame spectral instability in the whole chain (+2.1 dB of
+    // musical noise); deep fast expansion on a reverberant take chatters, and
+    // chatter is more audible than the room it removes.
+    r.gateRangeDb   = -std::clamp (std::max ((40.0f - r.snrDb) * 0.45f,
+                                             r.reverbRatio * 11.0f), 3.0f, 12.0f);
     r.gateAttackMs  = 1.5f;
     // release tracks the room so gating doesn't chop the natural tail
     // Deliberately NOT tied to RT60. The old rule stretched the release to
@@ -1029,7 +1032,8 @@ void VocalAnalyzer::deriveSettings (AnalysisResult& r)
     // Fast enough to dig into the valleys BETWEEN syllables, which is where
     // both room and residual noise live. Syllable gaps run 50-200 ms, so a
     // release much beyond that never acts before the next word arrives.
-    r.gateReleaseMs = std::clamp (45.0f + r.reverbRatio * 35.0f, 45.0f, 90.0f);
+    // Long enough not to chatter, short enough to still reach into the gaps.
+    r.gateReleaseMs = std::clamp (90.0f + r.reverbRatio * 60.0f, 90.0f, 150.0f);
 
     // ---- de-noise / de-verb: aggression scales with how bad the input is ----
     // Clean source -> near zero. Bad bedroom recording -> pushes hard.
@@ -1091,7 +1095,9 @@ void VocalAnalyzer::deriveSettings (AnalysisResult& r)
     // that syllable-rate modulation survives it.
     r.compPeakThreshDb  = r.integratedLufs + std::clamp (crest * 0.75f, 6.0f, 18.0f);
     r.compPeakRatio     = std::clamp (1.8f + crest / 14.0f, 2.0f, 3.2f);
-    r.compPeakAttackMs  = std::clamp (60.0f / crest, 2.0f, 15.0f);
+    // Not razor-fast: a very short attack on a peak stage modulates the
+    // waveform itself rather than its envelope, and that reads as grit.
+    r.compPeakAttackMs  = std::clamp (120.0f / crest, 4.0f, 20.0f);
     r.compPeakReleaseMs = std::clamp (crest * 5.0f, 40.0f, 160.0f);
 
     // Makeup restores what the stages remove at a typical loud moment, not at

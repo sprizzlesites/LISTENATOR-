@@ -54,6 +54,7 @@ void SpectralEngine::prepare (double sampleRate)
     mag.assign         (numBins, 0.0f);
     env.assign         (numBins, 0.0f);
     gains.assign       (numBins, 1.0f);
+    smoothGains.assign (numBins, 1.0f);
 
     calibrateOla();
     reset();
@@ -272,9 +273,11 @@ void SpectralEngine::processFrame()
         const float decay = deverbDecayPerHop;
         const float norm  = 1.0f - decay;
 
-        // How deep subtraction is allowed to go scales with how live the room
-        // measured. A dead room gets barely touched; a bad booth earns more.
-        const float maxCut = juce::jlimit (0.35f, 0.75f, 0.35f + deverb * 0.5f);
+        // Capped at half the bin. Beyond that, per-bin subtraction stops
+        // sounding like a drier room and starts sounding like a phaser: the
+        // estimate is never accurate enough per-bin to remove more than that
+        // without leaving holes the ear reads as warbling.
+        const float maxCut = juce::jlimit (0.25f, 0.50f, 0.25f + deverb * 0.35f);
         const float floorG = 1.0f - maxCut;
 
         for (int b = 0; b < numBins; ++b)
@@ -313,11 +316,31 @@ void SpectralEngine::processFrame()
         for (int b = 0; b < numBins; ++b) slot[(size_t) b] = mag[(size_t) b];
     }
 
-    // ---- smooth gains over time so bins don't chirp frame to frame ---------
+    // ---- smooth the gain curve ACROSS FREQUENCY ----------------------------
+    // Musical noise is isolated bins being attenuated very differently from
+    // their neighbours, then flickering between frames -- heard as warbling
+    // around the voice. Smoothing over time alone does not fix it, because the
+    // discontinuity is along the frequency axis. A few bins of averaging costs
+    // nothing in correction and is the standard cure.
+    //
+    // The window widens with frequency so it stays roughly constant in
+    // proportional terms rather than smearing narrow low-frequency detail.
     for (int b = 0; b < numBins; ++b)
     {
-        const float g = 0.6f * gains[(size_t) b] + 0.4f * prevGain[(size_t) b];
-        prevGain[(size_t) b] = gains[(size_t) b];
+        const int span = juce::jlimit (1, 6, b / 48 + 1);
+        const int a = juce::jmax (0, b - span);
+        const int c = juce::jmin (numBins - 1, b + span);
+
+        float sum = 0.0f;
+        for (int j = a; j <= c; ++j) sum += gains[(size_t) j];
+        smoothGains[(size_t) b] = sum / (float) (c - a + 1);
+    }
+
+    // ---- then smooth over time so bins don't chirp frame to frame ----------
+    for (int b = 0; b < numBins; ++b)
+    {
+        const float g = 0.55f * smoothGains[(size_t) b] + 0.45f * prevGain[(size_t) b];
+        prevGain[(size_t) b] = smoothGains[(size_t) b];
         cplx[b] *= juce::jlimit (0.0f, 1.0f, g);
     }
 
@@ -912,7 +935,8 @@ void CleanupChain::updateFilters()
     // relative to the level just before each gap.
     relativeOffsetLin = dbToGain (juce::jlimit (-24.0f, -8.0f, analysis.tailDb + 3.0f));
     progReleaseCoef   = timeCoef (1200.0f, sr);   // programme level, not syllables
-    expanderRatio     = juce::jlimit (1.5f, 3.5f, 1.5f + analysis.reverbRatio * 2.0f);
+    // Gentle: a high ratio turns the expander into a chattering gate.
+    expanderRatio     = juce::jlimit (1.4f, 2.2f, 1.4f + analysis.reverbRatio * 0.8f);
 }
 
 int CleanupChain::getLatencySamples() const noexcept
@@ -985,8 +1009,15 @@ void CleanupChain::process (juce::AudioBuffer<float>& buffer)
                 // chops the tail off mid-decay and sounds worse than the room.
                 const float over = detect > 1.0e-7f ? gainToDb (detect / juce::jmax (closeAt, 1.0e-7f))
                                                     : -60.0f;
-                const float reduction = over * (expanderRatio - 1.0f);
-                target = juce::jmax (gateRangeLin, dbToGain (reduction));
+
+                // `over` is only negative below the close threshold. Inside the
+                // hysteresis band the gate is still shut while the signal sits
+                // ABOVE closeAt, which makes it positive -- and an expander that
+                // acts on a positive overshoot amplifies instead of attenuating.
+                // That put up to +12 dB of gain on the quiet passages between
+                // words, which is to say on the room and the noise floor.
+                const float reduction = juce::jmin (0.0f, over) * (expanderRatio - 1.0f);
+                target = juce::jlimit (gateRangeLin, 1.0f, dbToGain (reduction));
             }
 
             const float coef = target > gateEnv ? gateAttackCoef : gateReleaseCoef;

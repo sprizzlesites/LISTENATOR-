@@ -167,6 +167,63 @@ float measureModulationDepth (const std::vector<float>& x, double sr)
     return (float) (std::sqrt (acc / n) / mean);
 }
 
+/** Musical-noise index: frame-to-frame instability of the spectrum.
+
+    Spectral subtraction and per-bin gain processing leave a characteristic
+    artifact -- isolated bins flickering on and off between frames, heard as
+    watery warbling around the voice. Clean audio changes smoothly frame to
+    frame; processed audio that warbles has high variance in the per-bin
+    log-magnitude difference.
+
+    Reported relative to the source, so a rising number means the chain is
+    ADDING instability that was not in the recording. */
+float measureMusicalNoise (const std::vector<float>& x, double sr)
+{
+    constexpr int order = 10, size = 1 << order, hop = size / 2;
+    juce::dsp::FFT fft (order);
+    juce::dsp::WindowingFunction<float> win ((size_t) size,
+                                             juce::dsp::WindowingFunction<float>::hann);
+    std::vector<float> scratch ((size_t) size * 2), prev ((size_t) size / 2, 0.0f);
+
+    float peak = 0.0f;
+    for (float v : x) peak = std::max (peak, std::abs (v));
+    if (peak < 1e-6f) return 0.0f;
+
+    double acc = 0.0; int n = 0; bool havePrev = false;
+
+    for (size_t st = 0; st + (size_t) size <= x.size(); st += (size_t) hop)
+    {
+        float framePeak = 0.0f;
+        for (int k = 0; k < size; ++k)
+            framePeak = std::max (framePeak, std::abs (x[st + (size_t) k]));
+
+        // Look at the low-level regions around and between words, which is
+        // where warbling is audible and where subtraction acts hardest.
+        const bool quiet = framePeak < peak * 0.08f && framePeak > peak * 0.0015f;
+
+        std::fill (scratch.begin(), scratch.end(), 0.0f);
+        std::copy (x.begin() + (long) st, x.begin() + (long) st + size, scratch.begin());
+        win.multiplyWithWindowingTable (scratch.data(), (size_t) size);
+        fft.performFrequencyOnlyForwardTransform (scratch.data());
+
+        if (havePrev && quiet)
+        {
+            for (int b = 4; b < size / 2; ++b)
+            {
+                const float a = std::max (scratch[(size_t) b], 1e-9f);
+                const float pv = std::max (prev[(size_t) b], 1e-9f);
+                const float d = 20.0f * std::log10 (a / pv);
+                acc += (double) d * d;
+                ++n;
+            }
+        }
+        for (int b = 0; b < size / 2; ++b) prev[(size_t) b] = scratch[(size_t) b];
+        havePrev = true;
+    }
+
+    return n > 0 ? (float) std::sqrt (acc / n) : 0.0f;
+}
+
 /** 1/3-octave LTAS of a signal, normalised the same way the analyser does
     (aligned on the 200 Hz - 2 kHz average) so it can be compared band for band
     against the target the correction was derived from. */
@@ -424,6 +481,8 @@ int main (int argc, char** argv)
 
     reportDynamics (dry, sr, "source");
     const float srcModulation = measureModulationDepth (dry, sr);
+    const float srcMusicalNoise = measureMusicalNoise (dry, sr);
+    std::printf ("  musical noise %.1f dB rms frame-to-frame (lower = cleaner)\n", srcMusicalNoise);
     std::printf ("  modulation depth %.3f  (higher = drier)\n", srcModulation);
 
     // ---- run the two renders ----------------------------------------------
@@ -433,8 +492,70 @@ int main (int argc, char** argv)
     // isolate the de-verb so its contribution is measurable on its own
     if (args.contains ("--diag"))
         variants.push_back ({ "deverbonly", true, false, true });
+
+    // One variant per stage, each with everything else bypassed, so the damage
+    // any single stage does is attributable rather than inferred.
+    struct Solo { const char* name; const char* keep; };
+    static const Solo solos[] = {
+        { "solo-declip",   pid::bpDeClip },   { "solo-plosive", pid::bpPlosive },
+        { "solo-hpf",      pid::bpHighPass }, { "solo-denoise", pid::bpDeNoise  },
+        { "solo-deverb",   pid::bpDeVerb },   { "solo-gate",    pid::bpGate     },
+        { "solo-surgical", pid::bpSurgical }, { "solo-resonance", pid::bpResonance },
+        { "solo-comp",     pid::bpComp },     { "solo-deess",   pid::bpDeEss    },
+        { "solo-tone",     pid::bpTone },     { "solo-limiter", pid::bpLimiter  },
+    };
+    const bool doSolo = args.contains ("--solo");
     if (args.contains ("--no-deverb"))
         variants[0].name = "cleanup-nodeverb";
+
+    if (doSolo)
+    {
+        std::printf ("\n=== per-stage isolation (everything else bypassed) ===\n");
+        for (const auto& solo : solos)
+        {
+            ListenatorProcessor p;
+            p.prepareToPlay (sr, kBlock);
+            auto& st = p.getState();
+            auto setP = [&] (const char* id, float v)
+            { if (auto* par = st.getParameter (id)) par->setValueNotifyingHost (v); };
+
+            setP (pid::effectsBypass, 1.0f);
+            for (const auto& other : solos) setP (other.keep, 1.0f);
+            setP (solo.keep, 0.0f);
+
+            juce::AudioBuffer<float> buf (2, kBlock);
+            juce::MidiBuffer midi;
+            auto run = [&] (size_t from, size_t to, std::vector<float>* o)
+            {
+                for (size_t i = from; i + kBlock <= to && i + kBlock <= dry.size(); i += kBlock)
+                {
+                    buf.clear();
+                    for (int k = 0; k < kBlock; ++k)
+                    { buf.setSample (0, k, dry[i + (size_t) k]); buf.setSample (1, k, dry[i + (size_t) k]); }
+                    p.processBlock (buf, midi);
+                    if (o) for (int k = 0; k < kBlock; ++k) o->push_back (buf.getSample (0, k));
+                }
+            };
+
+            p.triggerListen();
+            const size_t lf = (size_t) (listenAt * sr);
+            run (lf, lf + (size_t) (VocalAnalyzer::captureSeconds * sr + kBlock), nullptr);
+            for (int t = 0; t < 200 && ! p.hasAnalysis(); ++t)
+            { juce::Thread::sleep (25); buf.clear(); p.processBlock (buf, midi); }
+
+            std::vector<float> o; o.reserve (dry.size());
+            run (0, dry.size(), &o);
+            const int lat = p.getLatencySamples();
+            if (lat > 0 && (int) o.size() > lat) o.erase (o.begin(), o.begin() + lat);
+
+            auto st2 = measure (o, sr);
+            std::printf ("  %-16s rms %6.1f (src %.1f)  musicalNoise %5.1f (src %.1f)  mod %.3f\n",
+                         solo.name, st2.rmsDb, measure (dry, sr).rmsDb,
+                         measureMusicalNoise (o, sr), srcMusicalNoise,
+                         measureModulationDepth (o, sr));
+        }
+        std::printf ("\n");
+    }
 
     for (const auto& variant : variants)
     {
@@ -537,6 +658,8 @@ int main (int argc, char** argv)
         const float outMod  = measureModulationDepth (outL, sr);
         std::printf ("  tail %.1f dB (src %.1f)   modulation depth %.3f (src %.3f)\n",
                      outTail, p.getAnalysisResult().tailDb, outMod, srcModulation);
+        std::printf ("  musical noise %.1f dB rms frame-to-frame (source %.1f)\n",
+                     measureMusicalNoise (outL, sr), srcMusicalNoise);
         reportToneMatch (dry, outL, sr);
         reportDynamics (outL, sr, variant.name);
         auto s = measure (outL, sr);

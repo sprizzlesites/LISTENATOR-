@@ -98,7 +98,7 @@ private:
 
     // All scratch is preallocated: nothing here allocates on the audio thread.
     std::vector<float> inputRing, outputRing, frame;
-    std::vector<float> noiseMin, prevGain, mag, env, gains;
+    std::vector<float> noiseMin, prevGain, mag, env, gains, smoothGains;
 
     // Ring of past magnitude frames. Late reverberation is estimated from a
     // DELAYED spectrum rather than a running envelope of the current one: on
