@@ -64,6 +64,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout ListenatorProcessor::createL
         layout.add (std::make_unique<APB> (pv (id, 1), name, false));
     };
 
+    bp (pid::bpDeClip,   "Bypass De-Clip");   bp (pid::bpPlosive,  "Bypass Plosive");
     bp (pid::bpHighPass, "Bypass HPF");        bp (pid::bpDeNoise,  "Bypass De-Noise");
     bp (pid::bpDeVerb,   "Bypass De-Verb");    bp (pid::bpGate,     "Bypass Gate");
     bp (pid::bpSurgical, "Bypass Surgical");   bp (pid::bpResonance,"Bypass Resonance");
@@ -162,6 +163,8 @@ void ListenatorProcessor::pullParameters()
     auto flag = [&] (const char* id) { return raw (id) > 0.5f; };
 
     CleanupBypass cb;
+    cb.deClip     = flag (pid::bpDeClip);
+    cb.plosive    = flag (pid::bpPlosive);
     cb.highPass   = flag (pid::bpHighPass);
     cb.deNoise    = flag (pid::bpDeNoise);
     cb.deVerb     = flag (pid::bpDeVerb);

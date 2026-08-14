@@ -34,6 +34,8 @@ namespace pid
     inline constexpr const char* outputGain = "outputGain";
 
     // per-module bypasses
+    inline constexpr const char* bpDeClip    = "bpDeClip";
+    inline constexpr const char* bpPlosive   = "bpPlosive";
     inline constexpr const char* bpHighPass  = "bpHighPass";
     inline constexpr const char* bpDeNoise   = "bpDeNoise";
     inline constexpr const char* bpDeVerb    = "bpDeVerb";
@@ -101,6 +103,9 @@ public:
     float getGainReductionDb() const noexcept { return cleanup.getGainReductionDb(); }
     float getDeEssReductionDb() const noexcept { return cleanup.getDeEssReductionDb(); }
     float getDetectedHz() const noexcept { return effects.getDetectedHz(); }
+    float getPlosiveReductionDb() const noexcept { return cleanup.getPlosiveReductionDb(); }
+    int   getDeclippedCount() const noexcept     { return cleanup.getDeclippedCount(); }
+    float getPlosivePeakBoost() const noexcept   { return cleanup.getPlosivePeakBoost(); }
 
     /** Copy of the last published analysis, for the UI readouts. */
     const AnalysisResult& getAnalysisResult() const noexcept { return lastResult; }

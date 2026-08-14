@@ -389,6 +389,159 @@ void DualCompressor::process (juce::AudioBuffer<float>& buffer)
 }
 
 //==============================================================================
+// DeClipper
+//==============================================================================
+void DeClipper::prepare (double, int) { reset(); }
+void DeClipper::reset() { repaired = 0; }
+
+void DeClipper::process (juce::AudioBuffer<float>& buffer)
+{
+    const int n = buffer.getNumSamples();
+
+    for (int ch = 0; ch < buffer.getNumChannels(); ++ch)
+    {
+        auto* d = buffer.getWritePointer (ch);
+
+        for (int i = 1; i < n - 1; ++i)
+        {
+            if (std::abs (d[i]) < threshold) continue;
+
+            // find the extent of the flat top
+            int end = i;
+            while (end + 1 < n - 1 && std::abs (d[end + 1]) >= threshold) ++end;
+
+            const int run = end - i + 1;
+            if (run > maxRun) { i = end; continue; }   // too long to guess at
+
+            const int a = i - 1, b = std::min (end + 1, n - 1);
+            const float ya = d[a], yb = d[b];
+            const float sign = ya >= 0.0f ? 1.0f : -1.0f;
+
+            // Arc over the gap rather than a straight line: a clipped peak was
+            // going somewhere above full scale, and a chord across it leaves an
+            // audible flat spot in its place.
+            const float bulge = sign * threshold * 0.18f * (float) run / (float) maxRun;
+
+            for (int k = i; k <= end; ++k)
+            {
+                const float t = (float) (k - a) / (float) std::max (1, b - a);
+                const float lin = ya + (yb - ya) * t;
+                const float arch = std::sin (t * juce::MathConstants<float>::pi);
+                d[k] = juce::jlimit (-1.0f, 1.0f, lin + bulge * arch);
+            }
+
+            repaired += run;
+            i = end;
+        }
+    }
+}
+
+//==============================================================================
+// PlosiveGuard
+//==============================================================================
+void PlosiveGuard::prepare (double sampleRate, int maxBlockSize, int numChannels)
+{
+    sr = sampleRate;
+    juce::dsp::ProcessSpec spec { sampleRate, (juce::uint32) maxBlockSize,
+                                  (juce::uint32) numChannels };
+    lowBand.prepare (spec);
+    highBand.prepare (spec);
+    lowBand.setType  (juce::dsp::LinkwitzRileyFilterType::lowpass);
+    highBand.setType (juce::dsp::LinkwitzRileyFilterType::highpass);
+    setCornerHz (150.0f);
+
+    lowBuf.setSize (numChannels, maxBlockSize);
+    highBuf.setSize (numChannels, maxBlockSize);
+
+    attackCoef  = timeCoef (1.5f,  sampleRate);   // must catch the leading edge
+    releaseCoef = timeCoef (90.0f, sampleRate);
+    fastCoef    = timeCoef (2.0f,   sampleRate);
+    slowCoef    = timeCoef (180.0f, sampleRate);
+    reset();
+}
+
+void PlosiveGuard::setCornerHz (float hz) noexcept
+{
+    const float f = juce::jlimit (80.0f, 250.0f, hz);
+    lowBand.setCutoffFrequency (f);
+    highBand.setCutoffFrequency (f);
+}
+
+void PlosiveGuard::reset()
+{
+    lowBand.reset(); highBand.reset();
+    lowBuf.clear(); highBuf.clear();
+    lfFast = lfSlow = hfFast = hfSlow = 0.0f;
+    gain = 1.0f;
+    lastReductionDb = 0.0f;
+    peakLfBoost = 0.0f;
+}
+
+void PlosiveGuard::process (juce::AudioBuffer<float>& buffer)
+{
+    if (amount <= 0.0f) return;
+
+    const int numCh = juce::jmin (buffer.getNumChannels(), lowBuf.getNumChannels());
+    const int n = juce::jmin (buffer.getNumSamples(), lowBuf.getNumSamples());
+    if (numCh <= 0 || n <= 0) return;
+
+    for (int ch = 0; ch < numCh; ++ch)
+    {
+        lowBuf.copyFrom  (ch, 0, buffer, ch, 0, n);
+        highBuf.copyFrom (ch, 0, buffer, ch, 0, n);
+    }
+
+    { juce::dsp::AudioBlock<float> b (lowBuf);
+      auto sub = b.getSubBlock (0, (size_t) n);
+      juce::dsp::ProcessContextReplacing<float> ctx (sub); lowBand.process (ctx); }
+    { juce::dsp::AudioBlock<float> b (highBuf);
+      auto sub = b.getSubBlock (0, (size_t) n);
+      juce::dsp::ProcessContextReplacing<float> ctx (sub); highBand.process (ctx); }
+
+    float worst = 0.0f;
+
+    for (int i = 0; i < n; ++i)
+    {
+        float lo = 0.0f, hi = 0.0f;
+        for (int ch = 0; ch < numCh; ++ch)
+        {
+            lo = juce::jmax (lo, std::abs (lowBuf.getSample (ch, i)));
+            hi = juce::jmax (hi, std::abs (highBuf.getSample (ch, i)));
+        }
+
+        lfFast = fastCoef * lfFast + (1.0f - fastCoef) * lo;
+        lfSlow = slowCoef * lfSlow + (1.0f - slowCoef) * lo;
+        hfFast = fastCoef * hfFast + (1.0f - fastCoef) * hi;
+        hfSlow = slowCoef * hfSlow + (1.0f - slowCoef) * hi;
+
+        // How far each band has jumped above its own recent average.
+        const float lfBoost = lfFast / juce::jmax (lfSlow, 1.0e-5f);
+        const float hfBoost = hfFast / juce::jmax (hfSlow, 1.0e-5f);
+
+        // A sung note lifts both bands together. A plosive, a footstep or a
+        // knock on the boom arm lifts only the bottom.
+        float target = 1.0f;
+        if (lo > 3.0e-4f && lfBoost > 2.2f && lfBoost > hfBoost * 1.7f)
+        {
+            peakLfBoost = juce::jmax (peakLfBoost, lfBoost);
+            const float severity = juce::jlimit (0.0f, 1.0f, (lfBoost - 2.2f) / 5.0f);
+            target = juce::jmax (0.10f, 1.0f - severity * 0.9f * amount);
+        }
+
+        const float coef = target < gain ? attackCoef : releaseCoef;
+        gain = coef * gain + (1.0f - coef) * target;
+        worst = juce::jmin (worst, gainToDb (gain));
+
+        // duck only the low band; the rest of the voice passes untouched
+        for (int ch = 0; ch < numCh; ++ch)
+            buffer.setSample (ch, i,
+                              highBuf.getSample (ch, i) + lowBuf.getSample (ch, i) * gain);
+    }
+
+    lastReductionDb = worst;
+}
+
+//==============================================================================
 // BrickwallLimiter
 //==============================================================================
 void BrickwallLimiter::prepare (double sampleRate, int maxBlockSize, int numChannels)
@@ -567,6 +720,9 @@ void CleanupChain::prepare (double sampleRate, int maxBlockSize, int numChannels
     juce::dsp::ProcessSpec spec { sampleRate, (juce::uint32) maxBlock,
                                   (juce::uint32) channels };
 
+    deClip.prepare (sampleRate, channels);
+    plosive.prepare (sampleRate, maxBlock, channels);
+
     for (int ch = 0; ch < channels; ++ch)
     {
         hpf[ch].prepare (spec);
@@ -600,6 +756,8 @@ void CleanupChain::reset()
         for (auto& f : surgical[ch])  f.reset();
         for (auto& f : toneBands[ch]) f.reset();
     }
+    deClip.reset();
+    plosive.reset();
     comp.reset();
     deEss.reset();
     repair.reset();
@@ -682,6 +840,15 @@ void CleanupChain::updateFilters()
         spectral[ch].setResonanceDepth (bypass.resonance ? 0.0f : 0.55f * eqAmt);
     }
 
+    // The guard's corner follows the voice: cutting at a fixed 150 Hz would
+    // reach into the chest register of a low male voice.
+    // Sit the split below the fundamental: plosive energy peaks well under it,
+    // and crossing over on top of the voice makes the two indistinguishable.
+    plosive.setCornerHz (juce::jlimit (80.0f, 160.0f,
+                                       analysis.medianF0Hz > 60.0f
+                                           ? analysis.medianF0Hz * 0.75f : 120.0f));
+    plosive.setAmount (bypass.plosive ? 0.0f : trims.cleanupAmount);
+
     comp.setParams  (analysis, bypass.compressor ? 0.0f : trims.compAmount);
     deEss.setParams (analysis, bypass.deEss ? 0.0f : trims.deEssAmount);
 
@@ -714,7 +881,15 @@ void CleanupChain::process (juce::AudioBuffer<float>& buffer)
     const int numSamples = buffer.getNumSamples();
     const int numCh = juce::jmin (channels, buffer.getNumChannels());
 
-    // 1. high-pass, below this singer's lowest sung note
+    // 1. repair flat-topped peaks before anything measures them
+    if (! bypass.deClip)
+        deClip.process (buffer);
+
+    // 2. duck low-frequency bursts that aren't the voice
+    if (! bypass.plosive)
+        plosive.process (buffer);
+
+    // 3. high-pass, below this singer's lowest sung note
     if (! bypass.highPass)
         for (int ch = 0; ch < numCh; ++ch)
         {

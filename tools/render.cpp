@@ -134,6 +134,7 @@ void dumpAnalysis (const AnalysisResult& a)
     std::printf ("  timbre    F1 %.0f  F2 %.0f  F3 %.0f   centroid %.0f Hz   tilt %.2f dB/oct\n",
                  a.f1Hz, a.f2Hz, a.f3Hz, a.spectralCentroidHz, a.spectralTiltDbPerOct);
     std::printf ("  hpf       %.0f Hz\n", a.highPassHz);
+    std::printf ("  speech    quietest real delivery %.1f dB\n", a.speechFloorDb);
     std::printf ("  gate      thresh %.1f dB  range %.1f dB  rel %.0f ms\n",
                  a.gateThresholdDb, a.gateRangeDb, a.gateReleaseMs);
     std::printf ("  de-ess    centre %.0f Hz  bw %.2f oct  thresh %.1f dBFS  peak %.1f  spread %.1f  max %.1f dB\n",
@@ -220,6 +221,12 @@ int main (int argc, char** argv)
         juce::AudioBuffer<float> buf (2, kBlock);
         juce::MidiBuffer midi;
 
+        // Worst-case meter values across the WHOLE render. Sampling the
+        // processor after the last block reports whatever the tail of the file
+        // happened to leave behind, which for a track ending in silence is
+        // always "nothing happened".
+        float worstPlosive = 0.0f, worstGr = 0.0f, worstDeEss = 0.0f;
+
         auto pump = [&] (size_t from, size_t to, std::vector<float>* outL,
                          std::vector<float>* outR)
         {
@@ -232,6 +239,9 @@ int main (int argc, char** argv)
                     buf.setSample (1, k, dry[i + (size_t) k]);
                 }
                 p.processBlock (buf, midi);
+                worstPlosive = std::min (worstPlosive, p.getPlosiveReductionDb());
+                worstGr      = std::min (worstGr,      p.getGainReductionDb());
+                worstDeEss   = std::min (worstDeEss,   p.getDeEssReductionDb());
                 if (outL != nullptr)
                     for (int k = 0; k < kBlock; ++k)
                     {
@@ -280,7 +290,10 @@ int main (int argc, char** argv)
         }
 
         auto s = measure (outL, sr);
-        std::printf ("\n[%s] latency %d  ->  peak %.1f dBFS  rms %.1f  crest %.1f  LUFS %.1f  clipped %d\n",
+        std::printf ("  declipped %d samples   plosive guard max %.1f dB (LF transient ratio %.1f)\n",
+                     p.getDeclippedCount(), worstPlosive, p.getPlosivePeakBoost());
+        std::printf ("  compressor max %.1f dB   de-esser max %.1f dB\n", worstGr, worstDeEss);
+        std::printf ("[%s] latency %d  ->  peak %.1f dBFS  rms %.1f  crest %.1f  LUFS %.1f  clipped %d\n",
                      variant.name, latency, s.peakDb, s.rmsDb, s.crestDb, s.lufs, s.clipped);
         printLevelMap (outL, sr, variant.name);
 

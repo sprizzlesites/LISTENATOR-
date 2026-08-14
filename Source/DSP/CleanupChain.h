@@ -9,13 +9,15 @@ namespace listenator
 /** Per-module bypass flags for the corrective half. */
 struct CleanupBypass
 {
+    bool deClip = false, plosive = false;
     bool highPass = false, deNoise = false, deVerb = false, gate = false;
     bool surgicalEq = false, resonance = false, deEss = false;
     bool compressor = false, toneMatch = false, pitchRepair = false, limiter = false;
 
     bool operator== (const CleanupBypass& o) const noexcept
     {
-        return highPass == o.highPass && deNoise == o.deNoise && deVerb == o.deVerb
+        return deClip == o.deClip && plosive == o.plosive
+            && highPass == o.highPass && deNoise == o.deNoise && deVerb == o.deVerb
             && gate == o.gate && surgicalEq == o.surgicalEq && resonance == o.resonance
             && deEss == o.deEss && compressor == o.compressor && toneMatch == o.toneMatch
             && pitchRepair == o.pitchRepair && limiter == o.limiter;
@@ -141,6 +143,71 @@ private:
 };
 
 //==============================================================================
+/** Repairs flat-topped samples before anything else sees them.
+
+    A clipped peak is a horizontal run at full scale. Left alone it feeds
+    harmonic junk into every later stage and makes the compressor read a
+    transient that is not really there. Short runs are interpolated across from
+    the surrounding waveform, which will not recover the original peak but does
+    remove the corner that generates the distortion.
+*/
+class DeClipper
+{
+public:
+    void prepare (double sampleRate, int numChannels);
+    void reset();
+    void setThreshold (float lin) noexcept { threshold = lin; }
+
+    void process (juce::AudioBuffer<float>&);
+
+    int getRepairedCount() const noexcept { return repaired; }
+
+private:
+    float threshold = 0.985f;
+    int   maxRun = 64;
+    int   repaired = 0;
+};
+
+//==============================================================================
+/** Ducks low-frequency bursts that are not part of the voice.
+
+    Plosives, mic-stand knocks, footsteps and boom-arm bumps all look the same:
+    a sudden spike of energy below ~150 Hz with no matching rise higher up. A
+    sung note that is genuinely loud down there raises the whole spectrum, so
+    the RATIO of low to full band is what separates them -- a fixed low cut
+    would just thin every low note as well.
+*/
+class PlosiveGuard
+{
+public:
+    void prepare (double sampleRate, int maxBlockSize, int numChannels);
+    void reset();
+    void setAmount (float a) noexcept { amount = juce::jlimit (0.0f, 1.0f, a); }
+    void setCornerHz (float hz) noexcept;
+
+    void process (juce::AudioBuffer<float>&);
+
+    float getReductionDb() const noexcept { return lastReductionDb; }
+    float getPeakBoost()   const noexcept { return peakLfBoost; }
+
+private:
+    double sr = 44100.0;
+    juce::dsp::LinkwitzRileyFilter<float> lowBand, highBand;
+    juce::AudioBuffer<float> lowBuf, highBuf;
+
+    float amount = 1.0f;
+    // Fast/slow envelope pairs per band. A plosive is a burst that is fast in
+    // the low band and NOT matched in the high band; comparing steady levels
+    // instead fails whenever the fundamental sits near the crossover, which for
+    // a low male voice it always does.
+    float lfFast = 0.0f, lfSlow = 0.0f, hfFast = 0.0f, hfSlow = 0.0f;
+    float fastCoef = 0.0f, slowCoef = 0.0f;
+    float gain = 1.0f, attackCoef = 0.0f, releaseCoef = 0.0f;
+    float lastReductionDb = 0.0f;
+    float peakLfBoost = 0.0f;
+};
+
+//==============================================================================
 /** Lookahead brickwall limiter.
 
     juce::dsp::Limiter is deliberately not used here: it bolts on a fixed 4:1
@@ -215,6 +282,9 @@ public:
     float getGainReductionDb() const noexcept  { return comp.getGainReductionDb(); }
     float getDeEssReductionDb() const noexcept { return deEss.getReductionDb(); }
     float getGateGain() const noexcept         { return gateGain; }
+    float getPlosiveReductionDb() const noexcept { return plosive.getReductionDb(); }
+    float getPlosivePeakBoost()  const noexcept  { return plosive.getPeakBoost(); }
+    int   getDeclippedCount() const noexcept     { return deClip.getRepairedCount(); }
 
 private:
     void updateFilters();
@@ -234,6 +304,8 @@ private:
     std::array<juce::dsp::IIR::Filter<float>, numToneBands>   toneBands[2];
     int numSurgical = 0, numTone = 0;
 
+    DeClipper      deClip;
+    PlosiveGuard   plosive;
     SpectralEngine spectral[2];
     DualCompressor comp;
     DeEsser        deEss;
