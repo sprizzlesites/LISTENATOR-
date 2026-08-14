@@ -103,6 +103,27 @@ cmake --build build-linux --target UIRender
 ./build-linux/UIRender_artefacts/Release/LISTENATOR-UIRender ui-shots --analysed
 ```
 
+### Verifying the DSP
+
+`tools/dsptest.cpp` measures the processed audio against what the analysis
+claimed it would do — 27 assertions covering cold-start transparency, analysis
+accuracy against a known synthetic source, the applied EQ curve versus the
+intended one, compression behaviour, band-selectivity of the de-esser, PSOLA
+level preservation, trim-knob effect, bypass transparency and numerical
+stability.
+
+```bash
+cmake -B build-linux -G Ninja -DCMAKE_BUILD_TYPE=Release -DLISTENATOR_BUILD_TESTS=ON .
+cmake --build build-linux --target DspTest
+./build-linux/DspTest_artefacts/Release/DspTest
+```
+
+It exists because the first version of this chain had several defects that
+listening alone would not have localised — an overlap-add writing behind its
+read pointer, a de-ess threshold on the wrong magnitude scale, a compressor
+detector mismatched to its threshold, and 31 EQ filters stacking several dB
+past their target. Each is now a check.
+
 ### Verifying a build
 
 `tools/vst3hosttest.cpp` is a minimal VST3 host: it loads the DLL, enumerates

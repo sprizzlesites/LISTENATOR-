@@ -132,6 +132,52 @@ void CrtDisplay::paint (juce::Graphics& g)
         g.drawLine (x, plot.getY(), x, plot.getBottom(), 1.2f);
     }
 
+    // ---- noise floor, so you can see what the gate and de-noise face -------
+    {
+        juce::Path nf;
+        bool started = false;
+        for (int b = 0; b < numToneBands; ++b)
+        {
+            const float v = a.noiseLtasDb[(size_t) b];
+            if (v <= -119.0f) continue;
+            const float rel = juce::jlimit (-60.0f, 0.0f, v - maxDb);
+            const float y = plot.getBottom() + rel / 60.0f * plot.getHeight();
+            if (! started) { nf.startNewSubPath (bandX (b), y); started = true; }
+            else nf.lineTo (bandX (b), y);
+        }
+        g.setColour (purpleLight.withAlpha (0.55f));
+        g.strokePath (nf, juce::PathStrokeType (1.0f));
+    }
+
+    // ---- frequency ruler ---------------------------------------------------
+    g.setFont (DoofLookAndFeel::machineFont (8.0f, false));
+    g.setColour (crtGreen.withAlpha (0.4f));
+    for (float f : { 100.0f, 1000.0f, 10000.0f })
+    {
+        const float t = std::log10 (f / 20.0f) / std::log10 (1000.0f);
+        const float x = plot.getX() + t * plot.getWidth();
+        g.drawText (f >= 1000.0f ? juce::String ((int) (f / 1000.0f)) + "k"
+                                 : juce::String ((int) f),
+                    juce::Rectangle<float> (x - 14.0f, plot.getBottom() - 11.0f, 28.0f, 10.0f),
+                    juce::Justification::centred, false);
+    }
+
+    // ---- legend ------------------------------------------------------------
+    {
+        auto key = plot.removeFromTop (13.0f).removeFromRight (250.0f);
+        struct E { juce::Colour c; const char* label; };
+        const E entries[] = { { crtGreen, "SPECTRUM" }, { warningYellow, "CORRECTION" },
+                              { purpleLight, "NOISE" }, { dangerRed, "RESONANCE" } };
+        g.setFont (DoofLookAndFeel::machineFont (8.0f, true));
+        for (const auto& e : entries)
+        {
+            auto cell = key.removeFromLeft (62.0f);
+            g.setColour (e.c);
+            g.fillRect (cell.removeFromLeft (10.0f).withSizeKeepingCentre (9.0f, 2.0f));
+            g.drawText (e.label, cell, juce::Justification::centredLeft, false);
+        }
+    }
+
     // ---- readout corner ---------------------------------------------------
     g.setColour (crtGreen.withAlpha (0.85f));
     g.setFont (DoofLookAndFeel::machineFont (11.0f, false));
@@ -144,6 +190,8 @@ void CrtDisplay::paint (juce::Graphics& g)
     lines.add ("RT60 "   + juce::String (a.rt60Seconds, 2) + " s");
     lines.add ("SIB "    + juce::String ((int) a.deEssCentreHz) + " Hz");
     lines.add ("HPF "    + juce::String ((int) a.highPassHz) + " Hz");
+    lines.add ("GATE "   + juce::String ((int) a.gateThresholdDb) + " dB");
+    lines.add ("TILT "   + juce::String (a.spectralTiltDbPerOct, 1) + " dB/oct");
 
     auto textArea = plot.removeFromLeft (108.0f).reduced (2.0f)
                         .withHeight (13.0f * (float) lines.size() + 8.0f);

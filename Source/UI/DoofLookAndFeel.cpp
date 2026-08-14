@@ -38,11 +38,30 @@ void drawMetalPanel (juce::Graphics& g, juce::Rectangle<float> r,
         g.drawHorizontalLine ((int) y, r.getX(), r.getRight());
     g.restoreState();
 
-    // bevel
-    g.setColour ((recessed ? juce::Colours::black : juce::Colours::white).withAlpha (0.28f));
+    // specular sheen across the top third
+    if (! recessed)
+    {
+        g.setGradientFill (juce::ColourGradient (
+            juce::Colours::white.withAlpha (0.10f), r.getX(), r.getY(),
+            juce::Colours::transparentWhite, r.getX(), r.getY() + r.getHeight() * 0.45f,
+            false));
+        g.fillRoundedRectangle (r.reduced (1.5f), cornerSize);
+    }
+
+    // double bevel: bright top edge, dark bottom edge
+    g.setColour ((recessed ? juce::Colours::black : juce::Colours::white).withAlpha (0.30f));
     g.drawRoundedRectangle (r.reduced (0.5f), cornerSize, 1.4f);
-    g.setColour ((recessed ? juce::Colours::white : juce::Colours::black).withAlpha (0.35f));
+    g.setColour ((recessed ? juce::Colours::white : juce::Colours::black).withAlpha (0.38f));
     g.drawRoundedRectangle (r.reduced (1.8f), cornerSize, 1.0f);
+
+    // panel seam
+    if (r.getHeight() > 60.0f)
+    {
+        g.setColour (juce::Colours::black.withAlpha (0.16f));
+        g.drawHorizontalLine ((int) (r.getY() + 7.0f), r.getX() + 6.0f, r.getRight() - 6.0f);
+        g.setColour (juce::Colours::white.withAlpha (0.06f));
+        g.drawHorizontalLine ((int) (r.getY() + 8.0f), r.getX() + 6.0f, r.getRight() - 6.0f);
+    }
 
     // corner bolts
     if (r.getWidth() > 44.0f && r.getHeight() > 34.0f)
@@ -93,10 +112,33 @@ void drawCrtScreen (juce::Graphics& g, juce::Rectangle<float> r)
     for (float y = r.getY(); y < r.getBottom(); y += 3.0f)
         g.drawHorizontalLine ((int) y, r.getX(), r.getRight());
 
+    // corner vignette sells the curvature of the tube
+    for (int i = 0; i < 4; ++i)
+    {
+        const bool right = (i & 1) != 0, bottom = (i & 2) != 0;
+        const float cx = right ? r.getRight() : r.getX();
+        const float cy = bottom ? r.getBottom() : r.getY();
+        juce::ColourGradient v (juce::Colours::black.withAlpha (0.55f), cx, cy,
+                                juce::Colours::transparentBlack,
+                                r.getCentreX(), r.getCentreY(), true);
+        g.setGradientFill (v);
+        g.fillRoundedRectangle (r, 4.0f);
+    }
+
+    // glass reflection across the top-left
+    juce::Path glare;
+    glare.startNewSubPath (r.getX() + 4.0f, r.getY() + r.getHeight() * 0.42f);
+    glare.quadraticTo (r.getX() + r.getWidth() * 0.28f, r.getY() + 2.0f,
+                       r.getX() + r.getWidth() * 0.62f, r.getY() + 3.0f);
+    glare.lineTo (r.getX() + r.getWidth() * 0.30f, r.getY() + 3.0f);
+    glare.closeSubPath();
+    g.setColour (juce::Colours::white.withAlpha (0.035f));
+    g.fillPath (glare);
+
     // bezel
-    g.setColour (juce::Colours::black.withAlpha (0.7f));
-    g.drawRoundedRectangle (r, 4.0f, 2.0f);
-    g.setColour (mintGreen.withAlpha (0.25f));
+    g.setColour (juce::Colours::black.withAlpha (0.75f));
+    g.drawRoundedRectangle (r, 4.0f, 2.4f);
+    g.setColour (mintGreen.withAlpha (0.28f));
     g.drawRoundedRectangle (r.reduced (2.0f), 3.0f, 1.0f);
 }
 
@@ -212,6 +254,19 @@ void DoofLookAndFeel::drawRotarySlider (juce::Graphics& g, int x, int y, int wid
         g.drawLine ({ p1, p2 }, i % 5 == 0 ? 1.8f : 0.9f);
     }
 
+    // knurled skirt around the knob
+    const float skirtR = radius * 0.84f;
+    g.setColour (doof::metalDark.darker (0.4f));
+    g.fillEllipse (centre.x - skirtR, centre.y - skirtR, skirtR * 2.0f, skirtR * 2.0f);
+    g.setColour (doof::metalLight.withAlpha (0.20f));
+    for (int i = 0; i < 36; ++i)
+    {
+        const float a = (float) i / 36.0f * juce::MathConstants<float>::twoPi;
+        const auto p1 = centre.getPointOnCircumference (skirtR, a);
+        const auto p2 = centre.getPointOnCircumference (skirtR * 0.88f, a);
+        g.drawLine ({ p1, p2 }, 1.0f);
+    }
+
     // knob body
     const float knobR = radius * 0.76f;
     juce::ColourGradient body (doof::metalLight, centre.x - knobR * 0.5f, centre.y - knobR * 0.7f,
@@ -238,10 +293,19 @@ void DoofLookAndFeel::drawRotarySlider (juce::Graphics& g, int x, int y, int wid
     g.setColour (doof::warningYellow);
     g.drawLine ({ base, tip }, 2.4f);
 
+    // glassy highlight on the cap
+    g.setGradientFill (juce::ColourGradient (
+        juce::Colours::white.withAlpha (0.22f), centre.x - knobR * 0.4f, centre.y - knobR * 0.6f,
+        juce::Colours::transparentWhite, centre.x, centre.y + knobR * 0.3f, false));
+    g.fillEllipse (centre.x - knobR, centre.y - knobR, knobR * 2.0f, knobR * 2.0f);
+
     // centre cap
     g.setColour (doof::metalDark);
-    g.fillEllipse (centre.x - knobR * 0.2f, centre.y - knobR * 0.2f,
-                   knobR * 0.4f, knobR * 0.4f);
+    g.fillEllipse (centre.x - knobR * 0.22f, centre.y - knobR * 0.22f,
+                   knobR * 0.44f, knobR * 0.44f);
+    g.setColour (doof::metalLight.withAlpha (0.5f));
+    g.drawEllipse (centre.x - knobR * 0.22f, centre.y - knobR * 0.22f,
+                   knobR * 0.44f, knobR * 0.44f, 0.8f);
 }
 
 void DoofLookAndFeel::drawToggleButton (juce::Graphics& g, juce::ToggleButton& b,

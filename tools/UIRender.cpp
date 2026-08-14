@@ -37,7 +37,7 @@ public:
 
         editor.reset (dynamic_cast<listenator::ListenatorEditor*> (processor->createEditor()));
         jassert (editor != nullptr);
-        editor->setBounds (0, 0, 960, 700);
+        editor->setBounds (0, 0, 1100, 780);
 
         // let the editor's timer tick a few times so meters/lamps settle
         for (int i = 0; i < 6; ++i)
@@ -108,13 +108,35 @@ private:
             processor->processBlock (buf, midi);
         }
 
-        // give the analysis thread time to publish, then let processBlock pick it up
-        juce::Thread::sleep (900);
-        for (int b = 0; b < 8; ++b)
+        // Poll until the background analysis has published and processBlock has
+        // picked it up. A fixed sleep silently falls back to the idle UI when
+        // the analysis takes longer than expected.
+        for (int tries = 0; tries < 200 && ! processor->hasAnalysis(); ++tries)
         {
+            juce::Thread::sleep (25);
             buf.clear();
             processor->processBlock (buf, midi);
         }
+
+        // then run real audio so the meters and gauges have live values
+        for (int b = 0; b < 120; ++b)
+        {
+            buf.clear();
+            auto* d = buf.getWritePointer (0);
+            for (int i = 0; i < blockSize; ++i, ++sampleCounter)
+            {
+                const double t = (double) sampleCounter / sr;
+                phase += 2.0 * juce::MathConstants<double>::pi * 196.0 / sr;
+                float sv = 0.0f;
+                for (int h = 1; h <= 20; ++h) sv += (float) (std::sin (phase * h) / (h * h));
+                d[i] = sv * 0.4f * (float) (0.7 + 0.3 * std::sin (t * 3.0));
+            }
+            buf.copyFrom (1, 0, buf, 0, 0, blockSize);
+            processor->processBlock (buf, midi);
+        }
+
+        if (! processor->hasAnalysis())
+            std::printf ("WARNING: analysis did not complete; UI will show idle state\n");
     }
 
     void capture (const juce::File& out)

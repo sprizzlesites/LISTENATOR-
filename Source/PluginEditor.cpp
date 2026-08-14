@@ -74,7 +74,7 @@ ListenatorEditor::ListenatorEditor (ListenatorProcessor& p)
 
     currentQuote = doofart::quoteForIdle();
 
-    setSize (960, 700);
+    setSize (1100, 780);
     startTimerHz (30);
 }
 
@@ -181,17 +181,17 @@ void ListenatorEditor::resized()
 {
     auto r = getLocalBounds();
 
-    logoArea    = r.removeFromTop (66);
-    skylineArea = r.removeFromBottom (34);
+    logoArea    = r.removeFromTop (74);
+    skylineArea = r.removeFromBottom (56);
 
     // bottom racks
-    auto racks = r.removeFromBottom (250);
+    auto racks = r.removeFromBottom (272);
     cleanupRackArea = racks.removeFromLeft (racks.getWidth() / 2).reduced (8, 6);
     effectsRackArea = racks.reduced (8, 6);
 
     // upper section: doctor | crt+listen | gauges
-    doctorArea = r.removeFromLeft (168);
-    gaugeArea  = r.removeFromRight (196);
+    doctorArea = r.removeFromLeft (200);
+    gaugeArea  = r.removeFromRight (215);
 
     auto centre = r.reduced (8, 6);
     listenArea = centre.removeFromBottom (86);
@@ -282,19 +282,52 @@ void ListenatorEditor::paint (juce::Graphics& g)
     drawHazardStripes (g, logo.removeFromTop (7.0f));
     drawMetalPanel (g, logo.reduced (3.0f), 5.0f);
 
-    auto inner = logo.reduced (10.0f);
-    doofart::drawDeiLogo (g, inner.removeFromLeft (78.0f));
+    auto inner = logo.reduced (12.0f);
+    doofart::drawDeiLogo (g, inner.removeFromLeft (60.0f).reduced (0.0f, 2.0f));
+    inner.removeFromLeft (14.0f);
 
+    auto titleArea = inner.removeFromLeft (400.0f);
+    auto nameRow = titleArea.removeFromTop (titleArea.getHeight() * 0.66f);
+
+    // engraved lettering: dark offset under a bright face
+    g.setFont (DoofLookAndFeel::machineFont (38.0f, true));
+    g.setColour (juce::Colours::black.withAlpha (0.55f));
+    g.drawText ("LISTENATOR", nameRow.translated (1.5f, 1.5f),
+                juce::Justification::centredLeft, false);
     g.setColour (mintBright);
-    g.setFont (DoofLookAndFeel::machineFont (33.0f, true));
-    g.drawText ("LISTENATOR", inner.removeFromLeft (300.0f),
-                juce::Justification::centredLeft, false);
+    g.drawText ("LISTENATOR", nameRow, juce::Justification::centredLeft, false);
 
-    g.setColour (purpleLight);
-    g.setFont (DoofLookAndFeel::machineFont (11.0f, false));
-    g.drawText ("SPRIZZLE  //  DOOFENSHMIRTZ EVIL INCORPORATED",
-                inner.removeFromLeft (280.0f).translated (-296.0f, 21.0f),
-                juce::Justification::centredLeft, false);
+    g.setColour (purpleLight.withAlpha (0.9f));
+    g.setFont (DoofLookAndFeel::machineFont (10.5f, false));
+    g.drawText ("SPRIZZLE   //   DOOFENSHMIRTZ EVIL INCORPORATED   //   MODEL 1.0",
+                titleArea, juce::Justification::centredLeft, false);
+
+    // status LED cluster
+    {
+        auto leds = inner.removeFromLeft (150.0f).withSizeKeepingCentre (150.0f, 26.0f);
+        struct L { const char* name; bool on; juce::Colour c; };
+        const L lamps[] = {
+            { "PWR",   true,                                       mintGreen },
+            { "SIG",   proc.getInputLevelDb() > -60.0f,            warningYellow },
+            { "ANLZ",  proc.hasAnalysis(),                         crtGreen },
+            { "EVIL",  true,                                       dangerRed }
+        };
+        for (int i = 0; i < 4; ++i)
+        {
+            auto cell = leds.removeFromLeft (37.0f);
+            auto dot = cell.removeFromTop (11.0f).withSizeKeepingCentre (8.0f, 8.0f);
+            const auto c = lamps[i].on ? lamps[i].c : metalMid;
+            if (lamps[i].on)
+            { g.setColour (c.withAlpha (0.35f)); g.fillEllipse (dot.expanded (3.0f)); }
+            g.setColour (c);
+            g.fillEllipse (dot);
+            g.setColour (juce::Colours::black.withAlpha (0.5f));
+            g.drawEllipse (dot, 0.8f);
+            g.setColour (purpleLight.withAlpha (0.8f));
+            g.setFont (DoofLookAndFeel::machineFont (8.0f, true));
+            g.drawText (lamps[i].name, cell, juce::Justification::centredTop, false);
+        }
+    }
 
     // ---- the doctor --------------------------------------------------------
     auto doc = doctorArea.toFloat().reduced (6.0f);
@@ -319,8 +352,22 @@ void ListenatorEditor::paint (juce::Graphics& g)
                       juce::Justification::centred, 4);
 
     // leave a strip at the foot of the panel for the tubes
-    doofart::drawDoctor (g, doc.reduced (4.0f).withTrimmedTop (8.0f)
-                                .withTrimmedBottom (46.0f), mouthOpen);
+    {
+        auto figure = doc.reduced (2.0f).withTrimmedTop (4.0f).withTrimmedBottom (44.0f);
+        // a soft pool of light behind him lifts the figure off the panel
+        g.setGradientFill (juce::ColourGradient (
+            purpleLight.withAlpha (0.14f), figure.getCentreX(), figure.getCentreY(),
+            juce::Colours::transparentBlack, figure.getX() - 10.0f, figure.getY(), true));
+        g.fillEllipse (figure.expanded (8.0f, 0.0f));
+
+        doofart::drawDoctor (g, figure, mouthOpen);
+
+        // floor shadow
+        g.setColour (juce::Colours::black.withAlpha (0.22f));
+        g.fillEllipse (figure.getCentreX() - figure.getWidth() * 0.26f,
+                       figure.getBottom() - 6.0f,
+                       figure.getWidth() * 0.52f, 8.0f);
+    }
 
     // ---- decorative machinery around the CRT -------------------------------
     auto crtFrame = crtArea.toFloat();
@@ -381,8 +428,13 @@ void ListenatorEditor::paint (juce::Graphics& g)
     g.setColour (purpleDark.darker (0.6f));
     g.fillRect (sky);
     doofart::drawSkyline (g, sky, purpleDark.darker (0.85f));
-    doofart::drawPlatypus (g, sky.removeFromRight (54.0f).reduced (4.0f)
-                                 .translated (-6.0f, 0.0f));
+    // Perry, peering over the parapet. His fedora sits above the band, so the
+    // draw rect has to extend upward past it or the hat gets clipped.
+    {
+        auto perry = sky.removeFromRight (74.0f).translated (-8.0f, 0.0f);
+        doofart::drawPlatypus (g, juce::Rectangle<float> (
+            perry.getX(), perry.getY() - 6.0f, perry.getWidth(), perry.getHeight() + 10.0f));
+    }
 
     g.setColour (purpleLight.withAlpha (0.45f));
     g.setFont (DoofLookAndFeel::machineFont (9.0f, false));
