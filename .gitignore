@@ -4,3 +4,5 @@ JUCE/
 dist/
 ui-shots/
 *.zip
+renders/
+testaudio/
