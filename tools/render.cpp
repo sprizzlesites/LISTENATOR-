@@ -108,6 +108,65 @@ float measureTailDb (const std::vector<float>& x, double sr, float noiseFloorDb)
     return ratios[ratios.size() / 2];
 }
 
+/** Envelope modulation depth at syllable rate (2-8 Hz).
+
+    This is the measure that matters for "boxy". Reverberation fills the valleys
+    between syllables, so a washy recording has a shallower envelope than a dry
+    one carrying the same words. Unlike the gap-tail figure it stays meaningful
+    during continuous delivery, which is most of a rap vocal.
+
+    Higher is drier. */
+float measureModulationDepth (const std::vector<float>& x, double sr)
+{
+    // 20 ms envelope, which resolves syllables without tracking the waveform
+    const int frameLen = std::max (16, (int) (0.020 * sr));
+    std::vector<float> env;
+    for (size_t i = 0; i + (size_t) frameLen <= x.size(); i += (size_t) frameLen)
+    {
+        double a = 0.0;
+        for (int k = 0; k < frameLen; ++k) a += (double) x[i + (size_t) k] * x[i + (size_t) k];
+        env.push_back ((float) std::sqrt (a / frameLen));
+    }
+    if (env.size() < 64) return 0.0f;
+
+    // consider only the parts where there is actually a performance
+    std::vector<float> active;
+    float peak = 0.0f;
+    for (float v : env) peak = std::max (peak, v);
+    for (float v : env) if (v > peak * 0.02f) active.push_back (v);
+    if (active.size() < 64) return 0.0f;
+
+    double mean = 0.0;
+    for (float v : active) mean += v;
+    mean /= (double) active.size();
+    if (mean < 1e-9) return 0.0f;
+
+    // Bandpass the ENVELOPE to syllable rate before measuring its depth.
+    //
+    // A plain coefficient of variation counts take-to-take level jumps as
+    // modulation, so correctly levelling punch-ins recorded 15 dB apart scores
+    // as a loss -- which would push the tuning in exactly the wrong direction.
+    // Only 2-8 Hz is speech rhythm; slower is gain staging, faster is noise.
+    const double envRate = sr / (double) frameLen;      // ~50 Hz
+    const double hpCoef = std::exp (-2.0 * juce::MathConstants<double>::pi * 2.0 / envRate);
+    const double lpCoef = std::exp (-2.0 * juce::MathConstants<double>::pi * 8.0 / envRate);
+
+    double lowState = active[0], bandState = 0.0, acc = 0.0;
+    int n = 0;
+
+    for (float v : active)
+    {
+        lowState = hpCoef * lowState + (1.0 - hpCoef) * v;   // slow trend
+        const double highPassed = v - lowState;              // remove it
+        bandState = lpCoef * bandState + (1.0 - lpCoef) * highPassed;
+        acc += bandState * bandState;
+        ++n;
+    }
+
+    if (n == 0) return 0.0f;
+    return (float) (std::sqrt (acc / n) / mean);
+}
+
 void printLevelMap (const std::vector<float>& x, double sr, const char* label)
 {
     std::printf ("  %s level map (2 s cells, dBFS RMS):\n    ", label);
@@ -172,6 +231,8 @@ void dumpAnalysis (const AnalysisResult& a)
     std::printf ("  noise     floor %.1f dB   SNR %.1f dB\n", a.noiseFloorDb, a.snrDb);
     std::printf ("  room      RT60 %.2f s   tail %.1f dB from %d gaps   ratio %.2f   -> deverb %.2f\n",
                  a.rt60Seconds, a.tailDb, a.tailSamples, a.reverbRatio, a.deverbAmount);
+    std::printf ("            reverb during speech %.1f dB (gamma %.2f)\n",
+                 a.directToReverbDb, std::pow (10.0f, a.directToReverbDb / 20.0f));
     std::printf ("  denoise   amount %.2f\n", a.denoiseAmount);
     std::printf ("  pitch     medianF0 %.1f Hz   p05 %.1f   p95 %.1f   voiced %.0f%%   drift %.1f cents\n",
                  a.medianF0Hz, a.f0P05Hz, a.f0P95Hz, a.voicedFraction * 100.0f,
@@ -245,6 +306,9 @@ int main (int argc, char** argv)
                      s.peakDb, s.rmsDb, s.crestDb, s.lufs, s.clipped);
         printLevelMap (dry, sr, "source");
     }
+
+    const float srcModulation = measureModulationDepth (dry, sr);
+    std::printf ("  modulation depth %.3f  (higher = drier)\n", srcModulation);
 
     // ---- run the two renders ----------------------------------------------
     struct Variant { const char* name; bool cleanup; bool effects; bool deverbOnly; };
@@ -354,8 +418,9 @@ int main (int argc, char** argv)
         }
 
         const float outTail = measureTailDb (outL, sr, p.getAnalysisResult().noiseFloorDb);
-        std::printf ("  tail after processing: %.1f dB (source was %.1f dB)\n",
-                     outTail, p.getAnalysisResult().tailDb);
+        const float outMod  = measureModulationDepth (outL, sr);
+        std::printf ("  tail %.1f dB (src %.1f)   modulation depth %.3f (src %.3f)\n",
+                     outTail, p.getAnalysisResult().tailDb, outMod, srcModulation);
         auto s = measure (outL, sr);
         std::printf ("  declipped %d samples   plosive guard max %.1f dB (LF transient ratio %.1f)\n",
                      p.getDeclippedCount(), worstPlosive, p.getPlosivePeakBoost());

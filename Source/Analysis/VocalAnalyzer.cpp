@@ -557,20 +557,34 @@ void VocalAnalyzer::computeSibilance (AnalysisResult& r)
 
     for (auto& p : sibilantAvgPower) p /= (float) count;
 
-    // Pick the peak of the RATIO against the overall average spectrum, not of
-    // raw energy. A vocal spectrum falls with frequency, so a raw peak search
-    // lands at the low edge of the search window almost every time; the ratio
-    // isolates what is actually different about the sibilant frames.
-    int   peakBin = loBin;
-    float peakRatio = -1.0f;
+    // Energy-weighted centroid of the EXCESS -- how much louder the sibilant
+    // frames are than average, weighted by how much energy is actually there.
+    //
+    // Picking the peak of the bare ratio puts the band wherever the proportional
+    // jump is largest, which on a noisy recording is the top of the range where
+    // there is barely any signal. That lands male sibilance up around 9 kHz when
+    // it really sits between 5 and 8.
+    double num = 0.0, den = 0.0;
     for (int i = loBin; i <= hiBin; ++i)
     {
         const float ref = std::max (avgPower[(size_t) i], 1.0e-20f);
-        const float ratio = sibilantAvgPower[(size_t) i] / ref;
-        if (ratio > peakRatio) { peakRatio = ratio; peakBin = i; }
+        const float excess = sibilantAvgPower[(size_t) i] - ref;
+        if (excess <= 0.0f) continue;
+        const double w = (double) excess;
+        num += w * binToHz (i);
+        den += w;
     }
 
-    r.deEssCentreHz = binToHz (peakBin);
+    int peakBin = loBin;
+    if (den > 0.0)
+    {
+        r.deEssCentreHz = std::clamp ((float) (num / den), 3500.0f, 11000.0f);
+        peakBin = std::clamp ((int) std::round (r.deEssCentreHz * fftSize / sr), loBin, hiBin);
+    }
+    else
+    {
+        r.deEssCentreHz = 6500.0f;
+    }
 
     // -6 dB width of the sibilant hump sets the filter Q
     const float half = sibilantAvgPower[(size_t) peakBin] * 0.25f;
@@ -719,8 +733,8 @@ void VocalAnalyzer::computeResonances (AnalysisResult& r)
     }
 
     // A candidate must clear the threshold in most sub-windows to count.
-    constexpr float kProminenceDb = 3.5f;
-    constexpr int   kMinAgreement = 5;   // of 8
+    constexpr float kProminenceDb = 3.0f;
+    constexpr int   kMinAgreement = 4;   // of 8
 
     struct Cand { float hz, db; int agree; };
     std::vector<Cand> cands;
@@ -938,6 +952,19 @@ void VocalAnalyzer::computeReverb (AnalysisResult& r)
         // -40 dB is a dead room, -12 dB is a very live one. The earlier 20 dB
         // span pinned at 1.0 on anything real and lost all resolution.
         r.reverbRatio = std::clamp ((tailDb + 40.0f) / 28.0f, 0.0f, 1.0f);
+
+        // tailDb is measured in a window centred ~165 ms after the offset, by
+        // which point the room has already decayed a long way. What the de-verb
+        // needs is the reverberant level DURING delivery, which is that figure
+        // extrapolated back to the moment the voice stopped.
+        //
+        // Skipping this step understates the reverb by the whole decay -- here
+        // 8.8 dB, a factor of 2.8 in amplitude -- and the subtractor then removes
+        // almost nothing and looks broken.
+        const float windowCentreSec = 0.165f;
+        const float decayDbPerSec = r.rt60Seconds > 0.05f ? 60.0f / r.rt60Seconds : 120.0f;
+        r.directToReverbDb = std::clamp (tailDb + decayDbPerSec * windowCentreSec,
+                                         -24.0f, -3.0f);
     }
     else
     {
@@ -1010,7 +1037,10 @@ void VocalAnalyzer::deriveSettings (AnalysisResult& r)
     // to be closing inside the gap -- it could never act before the next word.
     // What stops it chopping the natural decay is the soft expansion ratio, not
     // a slow release.
-    r.gateReleaseMs = std::clamp (60.0f + r.reverbRatio * 60.0f, 60.0f, 140.0f);
+    // Fast enough to dig into the valleys BETWEEN syllables, which is where
+    // both room and residual noise live. Syllable gaps run 50-200 ms, so a
+    // release much beyond that never acts before the next word arrives.
+    r.gateReleaseMs = std::clamp (45.0f + r.reverbRatio * 35.0f, 45.0f, 90.0f);
 
     // ---- de-noise / de-verb: aggression scales with how bad the input is ----
     // Clean source -> near zero. Bad bedroom recording -> pushes hard.
@@ -1037,15 +1067,28 @@ void VocalAnalyzer::deriveSettings (AnalysisResult& r)
     // just catch occasional peaks.
     r.compLevelThreshDb  = r.integratedLufs - 3.0f;
     r.compLevelRatio     = std::clamp (1.0f + r.loudnessRangeDb / 8.0f, 1.5f, 4.0f);
-    r.compLevelAttackMs  = std::clamp (60.0f - crest, 15.0f, 60.0f);
-    r.compLevelReleaseMs = std::clamp (crest * 20.0f, 150.0f, 600.0f);
 
-    // Stage 2: fast peak control against a peak detector. Its threshold has to
-    // live on the peak scale, which sits a crest factor above the RMS one.
-    r.compPeakThreshDb  = r.integratedLufs + std::clamp (crest * 0.55f, 4.0f, 14.0f);
-    r.compPeakRatio     = std::clamp (2.0f + crest / 6.0f, 2.5f, 6.0f);
-    r.compPeakAttackMs  = std::clamp (60.0f / crest, 1.0f, 15.0f);
-    r.compPeakReleaseMs = std::clamp (crest * 6.0f, 40.0f, 200.0f);
+    // Slow on purpose. This stage exists to reconcile takes punched in at
+    // different levels, which is a change over SECONDS. Timings fast enough to
+    // follow syllables level the performance instead of the recording, and the
+    // envelope modulation that goes with it is what makes a vocal read as dry --
+    // flattening it sounds like more room, not less.
+    r.compLevelAttackMs  = std::clamp (crest * 12.0f, 120.0f, 400.0f);
+    r.compLevelReleaseMs = std::clamp (crest * 110.0f, 1200.0f, 3000.0f);
+
+    // Stage 2: peak control, and deliberately restrained.
+    //
+    // Compression flattens the envelope, and a flattened envelope fills the
+    // valleys between syllables -- perceptually the same thing reverberation
+    // does. Measured on a live-booth take, an aggressive peak stage cost more
+    // in envelope modulation (0.81 -> 0.62, where higher is drier) than the
+    // whole de-verb chain recovered. This stage exists to catch occasional
+    // peaks, not to level; the leveller above does the levelling, slowly enough
+    // that syllable-rate modulation survives it.
+    r.compPeakThreshDb  = r.integratedLufs + std::clamp (crest * 0.75f, 6.0f, 18.0f);
+    r.compPeakRatio     = std::clamp (1.8f + crest / 14.0f, 2.0f, 3.2f);
+    r.compPeakAttackMs  = std::clamp (60.0f / crest, 2.0f, 15.0f);
+    r.compPeakReleaseMs = std::clamp (crest * 5.0f, 40.0f, 160.0f);
 
     // Makeup restores what the stages remove at a typical loud moment, not at
     // the mean: estimating at the mean gives zero whenever the threshold sits
@@ -1054,8 +1097,8 @@ void VocalAnalyzer::deriveSettings (AnalysisResult& r)
     const float est1 = std::max (0.0f, loudRms - r.compLevelThreshDb)
                      * (1.0f - 1.0f / r.compLevelRatio);
     const float est2 = std::max (0.0f, r.peakDb - r.compPeakThreshDb)
-                     * (1.0f - 1.0f / r.compPeakRatio) * 0.5f;
-    r.makeupGainDb = std::clamp (est1 + est2, 0.0f, 12.0f);
+                     * (1.0f - 1.0f / r.compPeakRatio) * 0.4f;
+    r.makeupGainDb = std::clamp (est1 + est2, 0.0f, 10.0f);
 
     // ---- de-esser depth from how far the loud esses overshoot the threshold
     // Depth follows how far the esses stick out of the body, not a fixed value.

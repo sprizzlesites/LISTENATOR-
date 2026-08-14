@@ -131,13 +131,14 @@ void SpectralEngine::setDeverbDecay (float rt60) noexcept
                                       std::pow (10.0f, -3.0f * hopSeconds / rt60));
 }
 
-void SpectralEngine::setTailDb (float tailDb) noexcept
+void SpectralEngine::setTailDb (float directToReverbDb) noexcept
 {
-    // A -15 dB tail means the late field sits at 0.18 of the direct amplitude.
-    // During sustained delivery the delayed frame is about as loud as the
-    // current one, so this fraction IS the proportion that gets subtracted --
-    // which is why putting a 0..1 severity score here removes 89% of the voice.
-    deverbGamma = juce::jlimit (0.02f, 0.5f, dbToGain (juce::jlimit (-40.0f, -6.0f, tailDb)));
+    // The reverberant level during delivery, as an amplitude fraction. At
+    // -6 dB that is about half the signal, and subtracting half is what
+    // actually dries a room out. Passing the decayed tail figure instead makes
+    // this 0.18 and the stage does effectively nothing.
+    deverbGamma = juce::jlimit (0.05f, 0.75f,
+                                dbToGain (juce::jlimit (-24.0f, -3.0f, directToReverbDb)));
 }
 
 void SpectralEngine::process (float* block, int numSamples)
@@ -277,20 +278,22 @@ void SpectralEngine::processFrame()
 
             const float late = lateAccum[(size_t) b] * norm * deverbGamma;
 
-            // Only subtract where the room is actually what's left. While a bin
-            // is holding steady or rising, the direct sound dominates and there
-            // is nothing to remove; it is once the bin falls away from its own
-            // recent level that what remains is tail.
+            // Subtraction runs during sustained delivery too. An earlier
+            // version gated it to bins that were falling away from their own
+            // recent level, on the theory that only decays contain room -- but
+            // the reverberant field is loudest DURING speech, which is exactly
+            // where boxiness is heard. Gating it there left the stage doing
+            // nothing except in gaps the expander already handles.
             //
-            // Without this the heaviest subtraction lands on the last 100 ms of
-            // every syllable -- the voice's own decay, which is precisely the
-            // part that must survive.
+            // Onsets are protected instead: a bin rising sharply is new direct
+            // sound, and the room has not caught up with it yet.
             const float ref = past[(size_t) b];
-            const float fall = ref > 1.0e-9f
-                             ? juce::jlimit (0.0f, 1.0f, 1.0f - m / ref)
-                             : 0.0f;
+            const float rising = ref > 1.0e-9f
+                               ? juce::jlimit (0.0f, 1.0f, (m / ref - 1.0f) * 0.7f)
+                               : 0.0f;
+            const float protect = 1.0f - rising;
 
-            const float subtract = juce::jmin (late * deverb * fall, m * maxCut);
+            const float subtract = juce::jmin (late * deverb * protect, m * maxCut);
             gains[(size_t) b] *= juce::jmax (m - subtract, m * floorG) / m;
         }
     }
@@ -861,7 +864,7 @@ void CleanupChain::updateFilters()
         spectral[ch].setDenoiseAmount (bypass.deNoise ? 0.0f : analysis.denoiseAmount * clAmt);
         spectral[ch].setDeverbAmount  (bypass.deVerb  ? 0.0f : analysis.deverbAmount  * clAmt);
         spectral[ch].setDeverbDecay   (analysis.rt60Seconds);
-        spectral[ch].setTailDb        (analysis.tailDb);
+        spectral[ch].setTailDb        (analysis.directToReverbDb);
         spectral[ch].setHarmonicSpacing (analysis.medianF0Hz);
         spectral[ch].setResonanceDepth (bypass.resonance ? 0.0f : 0.55f * eqAmt);
     }
