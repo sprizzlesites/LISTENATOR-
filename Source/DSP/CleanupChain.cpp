@@ -10,11 +10,20 @@ namespace
     inline float dbToGain (float db) noexcept { return std::pow (10.0f, db / 20.0f); }
     inline float gainToDb (float g)  noexcept { return g > 1.0e-9f ? 20.0f * std::log10 (g) : -180.0f; }
 
-    /** One-pole smoothing coefficient for a given time constant. */
     inline float timeCoef (float ms, double sr) noexcept
     {
         if (ms <= 0.0f) return 0.0f;
         return std::exp (-1.0f / (float) (0.001 * ms * sr));
+    }
+
+    /** Q for a peaking filter whose -3 dB bandwidth spans `octaves`.
+        A 1/3-octave band needs Q ~ 4.3; using anything near 1 makes each
+        filter far wider than its band and the 31 of them stack into a curve
+        several times the intended depth. */
+    inline float qForBandwidth (float octaves) noexcept
+    {
+        const float p = std::pow (2.0f, octaves);
+        return std::sqrt (p) / (p - 1.0f);
     }
 }
 
@@ -24,12 +33,23 @@ namespace
 void SpectralEngine::prepare (double sampleRate)
 {
     sr = sampleRate;
-    inputRing.assign ((size_t) size * 2, 0.0f);
-    outputRing.assign ((size_t) size * 2, 0.0f);
-    frame.assign ((size_t) size * 2, 0.0f);
-    noiseMag.assign ((size_t) size / 2 + 1, 0.0f);
-    revEstimate.assign ((size_t) size / 2 + 1, 0.0f);
-    prevMag.assign ((size_t) size / 2 + 1, 0.0f);
+    ringLen = size * 4;
+    mask    = ringLen - 1;
+
+    const size_t numBins = (size_t) size / 2 + 1;
+
+    inputRing.assign  ((size_t) ringLen, 0.0f);
+    outputRing.assign ((size_t) ringLen, 0.0f);
+    frame.assign      ((size_t) size * 2, 0.0f);
+
+    noiseMin.assign    (numBins, 1.0e9f);
+    revEnvelope.assign (numBins, 0.0f);
+    prevGain.assign    (numBins, 1.0f);
+    mag.assign         (numBins, 0.0f);
+    env.assign         (numBins, 0.0f);
+    gains.assign       (numBins, 1.0f);
+
+    calibrateOla();
     reset();
 }
 
@@ -37,41 +57,89 @@ void SpectralEngine::reset()
 {
     std::fill (inputRing.begin(),  inputRing.end(),  0.0f);
     std::fill (outputRing.begin(), outputRing.end(), 0.0f);
-    std::fill (revEstimate.begin(), revEstimate.end(), 0.0f);
-    std::fill (prevMag.begin(), prevMag.end(), 0.0f);
-    writeIdx = 0;
+    std::fill (revEnvelope.begin(), revEnvelope.end(), 0.0f);
+    std::fill (noiseMin.begin(), noiseMin.end(), 1.0e9f);
+    std::fill (prevGain.begin(), prevGain.end(), 1.0f);
+    pos = 0;
     samplesUntilFrame = hop;
 }
 
-void SpectralEngine::setNoiseProfile (const float* magPerBin)
+/** Hann-squared at 75% overlap should sum to 1.5, but that assumes a
+    particular FFT normalisation convention. Measuring the real round-trip
+    removes the assumption -- and an error here is a flat level offset on
+    everything the STFT touches, which is easy to mistake for a DSP problem
+    elsewhere. */
+void SpectralEngine::calibrateOla()
 {
-    if (magPerBin != nullptr)
-        std::copy (magPerBin, magPerBin + noiseMag.size(), noiseMag.begin());
+    const int testLen = size * 8;
+    std::vector<float> in ((size_t) testLen), out ((size_t) testLen, 0.0f);
+    std::vector<float> f ((size_t) size * 2);
+
+    juce::Random rng (1234);
+    for (auto& v : in) v = rng.nextFloat() * 2.0f - 1.0f;
+
+    for (int start = 0; start + size <= testLen; start += hop)
+    {
+        std::fill (f.begin(), f.end(), 0.0f);
+        std::copy (in.begin() + start, in.begin() + start + size, f.begin());
+
+        win.multiplyWithWindowingTable (f.data(), (size_t) size);
+        fft.performRealOnlyForwardTransform (f.data(), true);
+        fft.performRealOnlyInverseTransform (f.data());
+        win.multiplyWithWindowingTable (f.data(), (size_t) size);
+
+        for (int i = 0; i < size; ++i)
+            out[(size_t) (start + i)] += f[(size_t) i];
+    }
+
+    // steady state only: the first and last frame are partially overlapped
+    double si = 0.0, so = 0.0;
+    for (int i = size; i < testLen - size; ++i)
+    {
+        si += (double) in[(size_t) i]  * in[(size_t) i];
+        so += (double) out[(size_t) i] * out[(size_t) i];
+    }
+
+    olaNorm = (so > 1.0e-12) ? (float) std::sqrt (si / so) : 2.0f / 3.0f;
+}
+
+void SpectralEngine::setHarmonicSpacing (float f0Hz) noexcept
+{
+    // Span at least four harmonics of the detected fundamental, so the
+    // envelope tracks the spectral shape rather than the comb.
+    if (f0Hz <= 20.0f) { minEnvSpanBins = 8; return; }
+    const float binHz = (float) (sr / size);
+    minEnvSpanBins = juce::jlimit (4, size / 8, (int) (4.0f * f0Hz / binHz));
 }
 
 void SpectralEngine::setDeverbDecay (float rt60) noexcept
 {
-    // Per-hop energy decay of the late field. Larger RT60 -> slower decay ->
-    // the running estimate carries further, so we subtract more tail.
-    if (rt60 <= 0.01f) { deverbAlpha = 0.0f; return; }
+    if (rt60 <= 0.01f) { deverbDecayPerHop = 0.0f; return; }
+
+    // Amplitude decay of the late field across one hop, from RT60.
     const float hopSeconds = (float) hop / (float) sr;
-    deverbAlpha = std::clamp (std::pow (10.0f, -3.0f * hopSeconds / rt60), 0.0f, 0.95f);
+    deverbDecayPerHop = juce::jlimit (0.0f, 0.999f,
+                                      std::pow (10.0f, -3.0f * hopSeconds / rt60));
 }
 
 void SpectralEngine::process (float* block, int numSamples)
 {
-    if (denoise <= 0.0f && deverb <= 0.0f && resonanceDepth <= 0.0f)
+    if (! isActive())
         return;
 
     for (int n = 0; n < numSamples; ++n)
     {
-        inputRing[(size_t) writeIdx] = block[n];
-        block[n] = outputRing[(size_t) writeIdx];
-        outputRing[(size_t) writeIdx] = 0.0f;
+        inputRing[(size_t) pos] = block[n];
 
-        writeIdx = (writeIdx + 1) % (size * 2);
+        // Output trails the input by one frame; clear each slot after reading
+        // so it is ready to accumulate again.
+        const int readIdx = (pos - size) & mask;
+        block[n] = outputRing[(size_t) readIdx];
+        outputRing[(size_t) readIdx] = 0.0f;
 
-        if (--samplesUntilFrame == 0)
+        pos = (pos + 1) & mask;
+
+        if (--samplesUntilFrame <= 0)
         {
             samplesUntilFrame = hop;
             processFrame();
@@ -81,11 +149,12 @@ void SpectralEngine::process (float* block, int numSamples)
 
 void SpectralEngine::processFrame()
 {
-    const int start = (writeIdx - size + size * 2) % (size * 2);
+    // Analyse the most recent `size` input samples.
+    const int start = (pos - size) & mask;
 
-    std::fill (frame.begin(), frame.end(), 0.0f);
     for (int i = 0; i < size; ++i)
-        frame[(size_t) i] = inputRing[(size_t) ((start + i) % (size * 2))];
+        frame[(size_t) i] = inputRing[(size_t) ((start + i) & mask)];
+    std::fill (frame.begin() + size, frame.end(), 0.0f);
 
     win.multiplyWithWindowingTable (frame.data(), (size_t) size);
     fft.performRealOnlyForwardTransform (frame.data(), true);
@@ -93,86 +162,111 @@ void SpectralEngine::processFrame()
     auto* cplx = reinterpret_cast<juce::dsp::Complex<float>*> (frame.data());
     const int numBins = size / 2 + 1;
 
-    // ---- spectral magnitudes -------------------------------------------
-    std::vector<float> mag ((size_t) numBins);
     for (int b = 0; b < numBins; ++b)
+    {
         mag[(size_t) b] = std::abs (cplx[b]);
+        gains[(size_t) b] = 1.0f;
+    }
 
-    // ---- resonance suppression: duck bins above their local envelope ----
-    std::vector<float> gains ((size_t) numBins, 1.0f);
-
+    // ---- resonance suppression: duck bins above their local envelope -------
     if (resonanceDepth > 0.0f)
     {
-        // envelope via moving average in log-frequency (~1/2 octave)
-        std::vector<float> env ((size_t) numBins);
+        // The envelope has to span SEVERAL harmonics. A window narrower than
+        // the harmonic spacing makes every harmonic of a voiced note look like
+        // a resonance, and the suppressor then flattens the singer's own
+        // harmonic series -- which is most of the voice.
         for (int b = 1; b < numBins; ++b)
         {
-            const int span = std::max (2, b / 6);
-            const int a = std::max (1, b - span), c = std::min (numBins - 1, b + span);
+            const int span = juce::jmax (minEnvSpanBins, b / 2);   // >= 1 octave
+            const int a = juce::jmax (1, b - span);
+            const int c = juce::jmin (numBins - 1, b + span);
+
             float sum = 0.0f;
             for (int j = a; j <= c; ++j) sum += mag[(size_t) j];
             env[(size_t) b] = sum / (float) (c - a + 1);
         }
 
+        // Harmonics still sit above a smoothed envelope by a few dB, so the
+        // trigger point has to clear that before anything is called resonant.
+        constexpr float kResonanceThreshDb = 9.0f;
+
         for (int b = 1; b < numBins; ++b)
         {
             if (env[(size_t) b] <= 1.0e-9f) continue;
             const float excessDb = gainToDb (mag[(size_t) b] / env[(size_t) b]);
-            if (excessDb > 3.0f)
-            {
-                const float cutDb = -(excessDb - 3.0f) * resonanceDepth;
-                gains[(size_t) b] *= dbToGain (std::max (cutDb, -18.0f));
-            }
+            if (excessDb > kResonanceThreshDb)
+                gains[(size_t) b] *= dbToGain (juce::jmax (
+                    -(excessDb - kResonanceThreshDb) * resonanceDepth, -12.0f));
         }
     }
 
-    // ---- de-noise: spectral subtraction against the measured profile ----
+    // ---- noise floor, tracked in THIS FFT's own units ----------------------
+    // Minimum statistics per bin. Learning the floor here rather than importing
+    // a figure measured with a different FFT size and window avoids having to
+    // reconcile two magnitude scales -- a conversion that is easy to get wrong
+    // by tens of dB and silently guts the signal.
+    for (int b = 0; b < numBins; ++b)
+    {
+        const float m = mag[(size_t) b];
+        if (m < noiseMin[(size_t) b])
+            noiseMin[(size_t) b] = 0.7f * noiseMin[(size_t) b] + 0.3f * m;
+        else
+            noiseMin[(size_t) b] *= 1.0004f;    // creep up so it can't stick low
+    }
+
+    // ---- de-noise: spectral subtraction against the tracked floor ----------
     if (denoise > 0.0f)
     {
-        const float over = 1.0f + 2.0f * denoise;   // over-subtraction factor
+        const float over = 1.0f + 1.5f * denoise;    // over-subtraction factor
         for (int b = 0; b < numBins; ++b)
         {
-            const float noise = noiseMag[(size_t) b] * over;
             const float m = mag[(size_t) b];
             if (m <= 1.0e-9f) continue;
-            // spectral floor keeps musical noise down instead of gating to zero
-            const float clean = std::max (m - noise, m * 0.05f);
+            // A spectral floor rather than a hard zero: full subtraction is
+            // what turns residual noise into musical-noise chirping.
+            const float clean = juce::jmax (m - noiseMin[(size_t) b] * over, m * 0.1f);
             gains[(size_t) b] *= clean / m;
         }
     }
 
-    // ---- de-verb: subtract the running late-field estimate ---------------
-    if (deverb > 0.0f && deverbAlpha > 0.0f)
+    // ---- de-verb: decaying peak-follower estimates the late field ----------
+    if (deverb > 0.0f && deverbDecayPerHop > 0.0f)
     {
         for (int b = 0; b < numBins; ++b)
         {
             const float m = mag[(size_t) b];
-            const float late = revEstimate[(size_t) b] * deverb;
-            if (m > 1.0e-9f)
+
+            // The estimate is a decaying peak, never a running sum: a sum has
+            // steady state alpha*m/(1-alpha), several times the signal itself,
+            // which pins every bin to the floor.
+            const float late = revEnvelope[(size_t) b];
+
+            if (m > 1.0e-9f && late > 0.0f)
             {
-                const float direct = std::max (m - late, m * 0.1f);
-                gains[(size_t) b] *= direct / m;
+                const float subtract = juce::jmin (late, m) * deverb;
+                gains[(size_t) b] *= juce::jmax (m - subtract, m * 0.12f) / m;
             }
-            // update the estimate from this frame's magnitude
-            revEstimate[(size_t) b] = deverbAlpha * (revEstimate[(size_t) b] + m);
+
+            revEnvelope[(size_t) b] = juce::jmax (revEnvelope[(size_t) b] * deverbDecayPerHop,
+                                                  m * deverbDecayPerHop);
         }
     }
 
-    // ---- smooth gains across time to avoid per-frame chirping ------------
+    // ---- smooth gains over time so bins don't chirp frame to frame ---------
     for (int b = 0; b < numBins; ++b)
     {
-        const float g = 0.6f * gains[(size_t) b] + 0.4f * prevMag[(size_t) b];
-        prevMag[(size_t) b] = gains[(size_t) b];
-        cplx[b] *= std::clamp (g, 0.0f, 1.0f);
+        const float g = 0.6f * gains[(size_t) b] + 0.4f * prevGain[(size_t) b];
+        prevGain[(size_t) b] = gains[(size_t) b];
+        cplx[b] *= juce::jlimit (0.0f, 1.0f, g);
     }
 
     fft.performRealOnlyInverseTransform (frame.data());
     win.multiplyWithWindowingTable (frame.data(), (size_t) size);
 
-    // Hann at 75% overlap sums to 1.5; normalise on the way out
-    constexpr float norm = 2.0f / 3.0f;
+    // Overlap-add AHEAD of the read pointer. The read point is `pos - size`,
+    // so writing at `pos` lands a full frame in the future and nothing is lost.
     for (int i = 0; i < size; ++i)
-        outputRing[(size_t) ((start + i) % (size * 2))] += frame[(size_t) i] * norm;
+        outputRing[(size_t) ((pos + i) & mask)] += frame[(size_t) i] * olaNorm;
 }
 
 //==============================================================================
@@ -181,41 +275,58 @@ void SpectralEngine::processFrame()
 void DualCompressor::prepare (double sampleRate, int)
 {
     sr = sampleRate;
+    rmsCoef = timeCoef (12.0f, sampleRate);   // ~12 ms RMS window
     reset();
 }
 
 void DualCompressor::reset()
 {
     leveller.env = peak.env = 0.0f;
+    rmsSquared = 0.0f;
     lastGrDb = 0.0f;
 }
 
 void DualCompressor::setParams (const AnalysisResult& a, float amount)
 {
-    const float amt = std::clamp (amount, 0.0f, 2.0f);
+    const float amt = juce::jlimit (0.0f, 2.0f, amount);
 
     leveller.threshDb    = a.compLevelThreshDb;
     leveller.ratio       = 1.0f + (a.compLevelRatio - 1.0f) * amt;
+    leveller.kneeDb      = 8.0f;
     leveller.attackCoef  = timeCoef (a.compLevelAttackMs,  sr);
     leveller.releaseCoef = timeCoef (a.compLevelReleaseMs, sr);
 
     peak.threshDb    = a.compPeakThreshDb;
     peak.ratio       = 1.0f + (a.compPeakRatio - 1.0f) * amt;
+    peak.kneeDb      = 4.0f;
     peak.attackCoef  = timeCoef (a.compPeakAttackMs,  sr);
     peak.releaseCoef = timeCoef (a.compPeakReleaseMs, sr);
 
     makeupDb = a.makeupGainDb * amt;
 }
 
+/** Soft-knee static curve. Returns gain reduction in dB (<= 0). */
+float DualCompressor::curve (const Stage& s, float detectorDb) noexcept
+{
+    const float over = detectorDb - s.threshDb;
+    const float slope = 1.0f - 1.0f / s.ratio;
+
+    if (over <= -s.kneeDb * 0.5f)
+        return 0.0f;
+
+    if (over >= s.kneeDb * 0.5f)
+        return -slope * over;
+
+    // quadratic interpolation across the knee
+    const float x = over + s.kneeDb * 0.5f;
+    return -slope * x * x / (2.0f * s.kneeDb);
+}
+
 float DualCompressor::applyStage (Stage& s, float detectorDb) noexcept
 {
-    // static curve (hard knee), then ballistics on the gain-reduction signal
-    float targetGr = 0.0f;
-    if (detectorDb > s.threshDb)
-        targetGr = (s.threshDb - detectorDb) * (1.0f - 1.0f / s.ratio);
-
-    const float coef = targetGr < s.env ? s.attackCoef : s.releaseCoef;
-    s.env = coef * s.env + (1.0f - coef) * targetGr;
+    const float target = curve (s, detectorDb);
+    const float coef = target < s.env ? s.attackCoef : s.releaseCoef;
+    s.env = coef * s.env + (1.0f - coef) * target;
     return s.env;
 }
 
@@ -225,46 +336,127 @@ void DualCompressor::process (juce::AudioBuffer<float>& buffer)
     const int numSamples = buffer.getNumSamples();
     const float makeup = dbToGain (makeupDb);
 
-    float maxGr = 0.0f;
+    float worstGr = 0.0f;
 
     for (int i = 0; i < numSamples; ++i)
     {
-        // linked detection across channels keeps the stereo image stable
-        float detect = 0.0f;
+        // Channel-linked detection keeps the stereo image stable.
+        float peakAbs = 0.0f, sumSq = 0.0f;
         for (int ch = 0; ch < numCh; ++ch)
-            detect = std::max (detect, std::abs (buffer.getSample (ch, i)));
+        {
+            const float x = buffer.getSample (ch, i);
+            peakAbs = juce::jmax (peakAbs, std::abs (x));
+            sumSq += x * x;
+        }
+        sumSq /= (float) juce::jmax (1, numCh);
 
-        const float detectDb = gainToDb (detect);
+        rmsSquared = rmsCoef * rmsSquared + (1.0f - rmsCoef) * sumSq;
 
-        const float gr1 = applyStage (leveller, detectDb);
-        const float gr2 = applyStage (peak, detectDb + gr1);
+        // Stage 1 is threshold-matched to integrated loudness, so it must see
+        // an RMS level. Feeding it peak would trigger a full crest factor early.
+        const float rmsDb  = 10.0f * std::log10 (juce::jmax (rmsSquared, 1.0e-12f));
+        const float peakDb = gainToDb (peakAbs);
+
+        const float gr1 = applyStage (leveller, rmsDb);
+        const float gr2 = applyStage (peak, peakDb + gr1);
         const float totalGr = gr1 + gr2;
 
-        maxGr = std::min (maxGr, totalGr);
+        worstGr = juce::jmin (worstGr, totalGr);
         const float g = dbToGain (totalGr) * makeup;
 
         for (int ch = 0; ch < numCh; ++ch)
             buffer.setSample (ch, i, buffer.getSample (ch, i) * g);
     }
 
-    lastGrDb = maxGr;
+    lastGrDb = worstGr;
+}
+
+//==============================================================================
+// BrickwallLimiter
+//==============================================================================
+void BrickwallLimiter::prepare (double sampleRate, int maxBlockSize, int numChannels)
+{
+    sr = sampleRate;
+    numCh = juce::jmax (1, numChannels);
+    lookahead = juce::jmax (8, (int) (0.0015 * sampleRate));   // 1.5 ms
+
+    delayLine.setSize (numCh, lookahead + maxBlockSize + 4);
+
+    // Attack reaches the target within the lookahead window, so the gain is
+    // already down by the time the offending sample arrives at the output.
+    attackCoef  = std::exp (-3.0f / (float) lookahead);
+    releaseCoef = timeCoef (80.0f, sampleRate);
+
+    reset();
+}
+
+void BrickwallLimiter::reset()
+{
+    delayLine.clear();
+    writeIdx = 0;
+    gain = 1.0f;
+}
+
+void BrickwallLimiter::setThresholdDb (float db) noexcept
+{
+    thresholdLin = dbToGain (db);
+}
+
+void BrickwallLimiter::process (juce::AudioBuffer<float>& buffer)
+{
+    const int n = buffer.getNumSamples();
+    const int ch = juce::jmin (numCh, buffer.getNumChannels());
+    const int len = delayLine.getNumSamples();
+    if (len <= 0) return;
+
+    for (int i = 0; i < n; ++i)
+    {
+        float peak = 0.0f;
+        for (int c = 0; c < ch; ++c)
+            peak = juce::jmax (peak, std::abs (buffer.getSample (c, i)));
+
+        // Below threshold the target is exactly 1.0, so the limiter is
+        // transparent rather than merely gentle.
+        const float target = peak > thresholdLin ? thresholdLin / peak : 1.0f;
+
+        const float coef = target < gain ? attackCoef : releaseCoef;
+        gain = coef * gain + (1.0f - coef) * target;
+
+        const int readIdx = (writeIdx + 1) % len;
+
+        for (int c = 0; c < ch; ++c)
+        {
+            const float delayed = delayLine.getSample (c, readIdx);
+            delayLine.setSample (c, writeIdx, buffer.getSample (c, i));
+
+            // Hard clip catches whatever the smoothed gain overshoots; it only
+            // ever engages on the residual, so it stays inaudible.
+            buffer.setSample (c, i, juce::jlimit (-thresholdLin, thresholdLin,
+                                                  delayed * gain));
+        }
+
+        writeIdx = readIdx;
+    }
 }
 
 //==============================================================================
 // DeEsser
 //==============================================================================
-void DeEsser::prepare (double sampleRate, int numChannels)
+void DeEsser::prepare (double sampleRate, int maxBlockSize, int numChannels)
 {
     sr = sampleRate;
-    juce::dsp::ProcessSpec spec { sampleRate, 512, (juce::uint32) numChannels };
+    juce::dsp::ProcessSpec spec { sampleRate, (juce::uint32) maxBlockSize,
+                                  (juce::uint32) numChannels };
 
     lowBand.prepare (spec);
     highBand.prepare (spec);
     lowBand.setType  (juce::dsp::LinkwitzRileyFilterType::lowpass);
     highBand.setType (juce::dsp::LinkwitzRileyFilterType::highpass);
 
-    sibBuffer.setSize (numChannels, 4096);
-    restBuffer.setSize (numChannels, 4096);
+    // Sized once, here: resizing inside process() would allocate on the
+    // audio thread.
+    sibBuffer.setSize (numChannels, maxBlockSize);
+    restBuffer.setSize (numChannels, maxBlockSize);
     reset();
 }
 
@@ -272,52 +464,49 @@ void DeEsser::reset()
 {
     lowBand.reset();
     highBand.reset();
-    for (auto& f : bandIsolate) f.reset();
+    sibBuffer.clear();
+    restBuffer.clear();
     env = 0.0f;
     lastReductionDb = 0.0f;
 }
 
 void DeEsser::setParams (const AnalysisResult& a, float amount)
 {
-    const float amt = std::clamp (amount, 0.0f, 2.0f);
+    const float amt = juce::jlimit (0.0f, 2.0f, amount);
 
-    // Split just below the measured sibilant centre so the band we duck is the
-    // one this particular singer's esses actually live in.
-    const float splitHz = std::clamp (a.deEssCentreHz * 0.72f, 2500.0f, 9000.0f);
+    // Split just below the measured sibilant centre, so the band that ducks is
+    // the one this particular singer's esses actually occupy.
+    const float splitHz = juce::jlimit (2500.0f, 9000.0f, a.deEssCentreHz * 0.72f);
     lowBand.setCutoffFrequency (splitHz);
     highBand.setCutoffFrequency (splitHz);
 
     thresholdDb    = a.deEssThresholdDb;
     maxReductionDb = a.deEssMaxReductionDb * amt;
+    ratio          = 4.0f;
 
-    attackCoef  = timeCoef (0.5f, sr);    // fast enough to catch an ess onset
+    attackCoef  = timeCoef (0.5f,  sr);   // fast enough to catch an ess onset
     releaseCoef = timeCoef (40.0f, sr);
 }
 
 void DeEsser::process (juce::AudioBuffer<float>& buffer)
 {
-    const int numCh = buffer.getNumChannels();
-    const int numSamples = buffer.getNumSamples();
-
-    if (sibBuffer.getNumSamples() < numSamples)
-    {
-        sibBuffer.setSize (numCh, numSamples, false, false, true);
-        restBuffer.setSize (numCh, numSamples, false, false, true);
-    }
+    const int numCh = juce::jmin (buffer.getNumChannels(), sibBuffer.getNumChannels());
+    const int numSamples = juce::jmin (buffer.getNumSamples(), sibBuffer.getNumSamples());
+    if (numCh <= 0 || numSamples <= 0) return;
 
     for (int ch = 0; ch < numCh; ++ch)
     {
-        sibBuffer.copyFrom (ch, 0, buffer, ch, 0, numSamples);
+        sibBuffer.copyFrom  (ch, 0, buffer, ch, 0, numSamples);
         restBuffer.copyFrom (ch, 0, buffer, ch, 0, numSamples);
     }
 
     { juce::dsp::AudioBlock<float> b (restBuffer);
-      juce::dsp::AudioBlock<float> sub = b.getSubBlock (0, (size_t) numSamples);
+      auto sub = b.getSubBlock (0, (size_t) numSamples);
       juce::dsp::ProcessContextReplacing<float> ctx (sub);
       lowBand.process (ctx); }
 
     { juce::dsp::AudioBlock<float> b (sibBuffer);
-      juce::dsp::AudioBlock<float> sub = b.getSubBlock (0, (size_t) numSamples);
+      auto sub = b.getSubBlock (0, (size_t) numSamples);
       juce::dsp::ProcessContextReplacing<float> ctx (sub);
       highBand.process (ctx); }
 
@@ -327,17 +516,18 @@ void DeEsser::process (juce::AudioBuffer<float>& buffer)
     {
         float detect = 0.0f;
         for (int ch = 0; ch < numCh; ++ch)
-            detect = std::max (detect, std::abs (sibBuffer.getSample (ch, i)));
+            detect = juce::jmax (detect, std::abs (sibBuffer.getSample (ch, i)));
 
         const float detectDb = gainToDb (detect);
 
         float target = 0.0f;
         if (detectDb > thresholdDb)
-            target = std::max (maxReductionDb, (thresholdDb - detectDb) * 0.8f);
+            target = juce::jmax (maxReductionDb,
+                                 -(detectDb - thresholdDb) * (1.0f - 1.0f / ratio));
 
         const float coef = target < env ? attackCoef : releaseCoef;
         env = coef * env + (1.0f - coef) * target;
-        worst = std::min (worst, env);
+        worst = juce::jmin (worst, env);
 
         const float g = dbToGain (env);
         for (int ch = 0; ch < numCh; ++ch)
@@ -355,25 +545,31 @@ void CleanupChain::prepare (double sampleRate, int maxBlockSize, int numChannels
 {
     sr = sampleRate;
     channels = juce::jlimit (1, 2, numChannels);
+    maxBlock = juce::jmax (32, maxBlockSize);
 
-    juce::dsp::ProcessSpec spec { sampleRate, (juce::uint32) maxBlockSize,
+    juce::dsp::ProcessSpec spec { sampleRate, (juce::uint32) maxBlock,
                                   (juce::uint32) channels };
 
     for (int ch = 0; ch < channels; ++ch)
     {
         hpf[ch].prepare (spec);
         spectral[ch].prepare (sampleRate);
+        for (auto& f : surgical[ch])  f.prepare ({ sampleRate, (juce::uint32) maxBlock, 1 });
+        for (auto& f : toneBands[ch]) f.prepare ({ sampleRate, (juce::uint32) maxBlock, 1 });
     }
 
     comp.prepare (sampleRate, channels);
-    deEss.prepare (sampleRate, channels);
+    deEss.prepare (sampleRate, maxBlock, channels);
 
-    limiter.prepare (spec);
-    limiter.setThreshold (-0.8f);
-    limiter.setRelease (60.0f);
+    // Cleanup-half pitch repair: slow, wide dead zone, partial strength. This
+    // is intonation repair, not an effect -- it should never be audible as one.
+    repair.prepare (sampleRate, maxBlock);
+    repair.setRetuneMs (220.0f);
+    repair.setStrength (0.5f);
+    repair.setDeadZoneCents (22.0f);
 
-    repairTracker.prepare (sampleRate, 2048);
-    monoScratch.setSize (1, maxBlockSize);
+    limiter.prepare (sampleRate, maxBlock, channels);
+    limiter.setThresholdDb (-0.8f);
 
     reset();
 }
@@ -389,9 +585,11 @@ void CleanupChain::reset()
     }
     comp.reset();
     deEss.reset();
+    repair.reset();
     limiter.reset();
-    gateEnv = 0.0f;
+    gateEnv = 1.0f;
     gateGain = 1.0f;
+    gateOpen = false;
 }
 
 void CleanupChain::applyAnalysis (const AnalysisResult& a)
@@ -401,57 +599,76 @@ void CleanupChain::applyAnalysis (const AnalysisResult& a)
     updateFilters();
 }
 
+void CleanupChain::setBypass (const CleanupBypass& b)
+{
+    if (b == bypass) return;          // recomputing coefficients every block
+    bypass = b;                       // would be pointless work on the audio thread
+    if (haveAnalysis) updateFilters();
+}
+
+void CleanupChain::setTrims (const CleanupTrims& t)
+{
+    if (t == trims) return;
+    trims = t;
+    if (haveAnalysis) updateFilters();
+}
+
 void CleanupChain::updateFilters()
 {
     if (! haveAnalysis) return;
 
-    const float eqAmt = std::clamp (trims.eqAmount, 0.0f, 2.0f);
-    const float clAmt = std::clamp (trims.cleanupAmount, 0.0f, 2.0f);
+    const float eqAmt = juce::jlimit (0.0f, 2.0f, trims.eqAmount);
+    const float clAmt = juce::jlimit (0.0f, 2.0f, trims.cleanupAmount);
+
+    // A 1/3-octave band: the filters must be this narrow or 31 of them stack
+    // into a curve several times deeper than the one we measured.
+    const float toneQ = qForBandwidth (1.0f / 3.0f);
 
     for (int ch = 0; ch < channels; ++ch)
     {
         *hpf[ch].coefficients =
             *juce::dsp::IIR::Coefficients<float>::makeHighPass (sr, analysis.highPassHz, 0.707f);
 
-        // surgical notches from the resonance detector
-        surgical[ch].clear();
+        // Fixed-size arrays with a live count: updateFilters can be reached
+        // from the audio thread when a trim knob moves, so it must not allocate.
+        numSurgical = 0;
         for (const auto& r : analysis.resonances)
         {
-            juce::dsp::IIR::Filter<float> f;
-            f.coefficients = juce::dsp::IIR::Coefficients<float>::makePeakFilter (
-                                 sr, r.frequencyHz, r.q, dbToGain (r.gainDb * eqAmt));
-            f.prepare ({ sr, 512, 1 });
-            surgical[ch].push_back (std::move (f));
+            if (numSurgical >= maxSurgical) break;
+            *surgical[ch][(size_t) numSurgical].coefficients =
+                *juce::dsp::IIR::Coefficients<float>::makePeakFilter (
+                     sr, r.frequencyHz, r.q, dbToGain (r.gainDb * eqAmt));
+            ++numSurgical;
         }
 
-        // tone match: one peaking filter per 1/3-octave band that needs a move
-        toneBands[ch].clear();
+        numTone = 0;
         for (int b = 0; b < numToneBands; ++b)
         {
-            const float g = analysis.toneMatchDb[(size_t) b] * eqAmt;
-            if (std::abs (g) < 0.35f) continue;                 // skip no-ops
+            // Use the solved gains, not the raw target: neighbouring 1/3-octave
+            // filters overlap, so the two differ by several dB.
+            const float g = analysis.toneFilterGainDb[(size_t) b] * eqAmt;
+            if (std::abs (g) < 0.2f) continue;
             const float f0 = toneBandHz[(size_t) b];
             if (f0 < 30.0f || f0 > sr * 0.45) continue;
 
-            juce::dsp::IIR::Filter<float> f;
-            f.coefficients = juce::dsp::IIR::Coefficients<float>::makePeakFilter (
-                                 sr, f0, 1.6f, dbToGain (g));
-            f.prepare ({ sr, 512, 1 });
-            toneBands[ch].push_back (std::move (f));
+            *toneBands[ch][(size_t) numTone].coefficients =
+                *juce::dsp::IIR::Coefficients<float>::makePeakFilter (
+                     sr, f0, toneQ, dbToGain (g));
+            ++numTone;
         }
 
-        spectral[ch].setDenoiseAmount (bypass.deNoise ? 0.0f
-                                        : std::clamp (analysis.denoiseAmount * clAmt, 0.0f, 1.0f));
-        spectral[ch].setDeverbAmount  (bypass.deVerb ? 0.0f
-                                        : std::clamp (analysis.deverbAmount * clAmt, 0.0f, 1.0f));
+        spectral[ch].setDenoiseAmount (bypass.deNoise ? 0.0f : analysis.denoiseAmount * clAmt);
+        spectral[ch].setDeverbAmount  (bypass.deVerb  ? 0.0f : analysis.deverbAmount  * clAmt);
         spectral[ch].setDeverbDecay   (analysis.rt60Seconds);
+        spectral[ch].setHarmonicSpacing (analysis.medianF0Hz);
         spectral[ch].setResonanceDepth (bypass.resonance ? 0.0f : 0.55f * eqAmt);
     }
 
-    comp.setParams (analysis, bypass.compressor ? 0.0f : trims.compAmount);
+    comp.setParams  (analysis, bypass.compressor ? 0.0f : trims.compAmount);
     deEss.setParams (analysis, bypass.deEss ? 0.0f : trims.deEssAmount);
 
-    gateThreshLin   = dbToGain (analysis.gateThresholdDb);
+    gateOpenLin     = dbToGain (analysis.gateThresholdDb);
+    gateCloseLin    = dbToGain (analysis.gateThresholdDb - 6.0f);   // 6 dB hysteresis
     gateRangeLin    = dbToGain (analysis.gateRangeDb);
     gateAttackCoef  = timeCoef (analysis.gateAttackMs,  sr);
     gateReleaseCoef = timeCoef (analysis.gateReleaseMs, sr);
@@ -459,7 +676,16 @@ void CleanupChain::updateFilters()
 
 int CleanupChain::getLatencySamples() const noexcept
 {
-    return haveAnalysis ? SpectralEngine::size : 0;
+    if (! haveAnalysis) return 0;
+
+    int latency = 0;
+    if (! bypass.deNoise || ! bypass.deVerb || ! bypass.resonance)
+        latency += SpectralEngine::getLatencySamples();
+    if (! bypass.pitchRepair)
+        latency += repair.getLatencySamples();
+    if (! bypass.limiter)
+        latency += limiter.getLatencySamples();
+    return latency;
 }
 
 void CleanupChain::process (juce::AudioBuffer<float>& buffer)
@@ -468,9 +694,9 @@ void CleanupChain::process (juce::AudioBuffer<float>& buffer)
         return;
 
     const int numSamples = buffer.getNumSamples();
-    const int numCh = std::min (channels, buffer.getNumChannels());
+    const int numCh = juce::jmin (channels, buffer.getNumChannels());
 
-    // 1. high-pass, placed below this singer's lowest sung note
+    // 1. high-pass, below this singer's lowest sung note
     if (! bypass.highPass)
         for (int ch = 0; ch < numCh; ++ch)
         {
@@ -479,20 +705,25 @@ void CleanupChain::process (juce::AudioBuffer<float>& buffer)
                 d[i] = hpf[ch].processSample (d[i]);
         }
 
-    // 2/3/7. de-noise + de-verb + resonance suppression share one STFT
+    // 2. de-noise + de-verb + resonance suppression, sharing one STFT
     for (int ch = 0; ch < numCh; ++ch)
         spectral[ch].process (buffer.getWritePointer (ch), numSamples);
 
-    // 4. gate, threshold set from the measured noise floor
+    // 3. gate, threshold from the measured noise floor, with hysteresis
     if (! bypass.gate)
     {
         for (int i = 0; i < numSamples; ++i)
         {
             float detect = 0.0f;
             for (int ch = 0; ch < numCh; ++ch)
-                detect = std::max (detect, std::abs (buffer.getSample (ch, i)));
+                detect = juce::jmax (detect, std::abs (buffer.getSample (ch, i)));
 
-            const float target = detect > gateThreshLin ? 1.0f : gateRangeLin;
+            // Separate open/close thresholds: a single one chatters when the
+            // signal sits right on it.
+            if (! gateOpen && detect > gateOpenLin)  gateOpen = true;
+            else if (gateOpen && detect < gateCloseLin) gateOpen = false;
+
+            const float target = gateOpen ? 1.0f : gateRangeLin;
             const float coef = target > gateEnv ? gateAttackCoef : gateReleaseCoef;
             gateEnv = coef * gateEnv + (1.0f - coef) * target;
 
@@ -502,41 +733,45 @@ void CleanupChain::process (juce::AudioBuffer<float>& buffer)
         gateGain = gateEnv;
     }
 
-    // 5. surgical notches
+    // 4. surgical notches
     if (! bypass.surgicalEq)
         for (int ch = 0; ch < numCh; ++ch)
         {
             auto* d = buffer.getWritePointer (ch);
-            for (auto& f : surgical[ch])
+            for (int k = 0; k < numSurgical; ++k)
                 for (int i = 0; i < numSamples; ++i)
-                    d[i] = f.processSample (d[i]);
+                    d[i] = surgical[ch][(size_t) k].processSample (d[i]);
         }
 
-    // 6. two-stage compression
+    // 5. two-stage compression
     if (! bypass.compressor)
         comp.process (buffer);
 
-    // 8. de-ess AFTER compression, BEFORE any additive HF
+    // 6. de-ess AFTER compression, BEFORE the tone stage's additive HF
     if (! bypass.deEss)
         deEss.process (buffer);
 
-    // 9. tone match to the universal target curve
+    // 7. tone match to the universal target curve
     if (! bypass.toneMatch)
         for (int ch = 0; ch < numCh; ++ch)
         {
             auto* d = buffer.getWritePointer (ch);
-            for (auto& f : toneBands[ch])
+            for (int k = 0; k < numTone; ++k)
                 for (int i = 0; i < numSamples; ++i)
-                    d[i] = f.processSample (d[i]);
+                    d[i] = toneBands[ch][(size_t) k].processSample (d[i]);
         }
 
-    // 11. true-peak safety limiter
-    if (! bypass.limiter)
+    // 8. transparent intonation repair (mono source drives the chain)
+    if (! bypass.pitchRepair)
     {
-        juce::dsp::AudioBlock<float> block (buffer);
-        juce::dsp::ProcessContextReplacing<float> ctx (block);
-        limiter.process (ctx);
+        repair.process (buffer.getWritePointer (0), numSamples);
+        for (int ch = 1; ch < numCh; ++ch)
+            buffer.copyFrom (ch, 0, buffer, 0, 0, numSamples);
     }
+
+    // 9. safety limiter
+    if (! bypass.limiter)
+        limiter.process (buffer);
 }
 
 } // namespace listenator

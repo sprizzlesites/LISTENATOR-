@@ -14,162 +14,6 @@ namespace
         return ms <= 0.0f ? 0.0f : std::exp (-1.0f / (float) (0.001 * ms * sr));
     }
 
-    /** Semitone offsets from the root for each supported scale. */
-    const std::vector<int>& scaleSteps (Scale s)
-    {
-        static const std::vector<int> chromatic { 0,1,2,3,4,5,6,7,8,9,10,11 };
-        static const std::vector<int> major     { 0,2,4,5,7,9,11 };
-        static const std::vector<int> minor     { 0,2,3,5,7,8,10 };
-        static const std::vector<int> harmMinor { 0,2,3,5,7,8,11 };
-        static const std::vector<int> pentMaj   { 0,2,4,7,9 };
-        static const std::vector<int> pentMin   { 0,3,5,7,10 };
-
-        switch (s)
-        {
-            case Scale::major:            return major;
-            case Scale::minor:            return minor;
-            case Scale::harmonicMinor:    return harmMinor;
-            case Scale::pentatonicMajor:  return pentMaj;
-            case Scale::pentatonicMinor:  return pentMin;
-            case Scale::chromatic:
-            default:                      return chromatic;
-        }
-    }
-}
-
-//==============================================================================
-// PitchCorrector - TD-PSOLA
-//==============================================================================
-void PitchCorrector::prepare (double sampleRate, int maxBlockSize)
-{
-    sr = sampleRate;
-    tracker.prepare (sampleRate, frameSize);
-    tracker.setRange (60.0f, 1200.0f);
-
-    const int ringLen = juce::nextPowerOfTwo (std::max (16384, maxBlockSize * 4));
-    inBuf.assign ((size_t) ringLen, 0.0f);
-    outBuf.assign ((size_t) ringLen, 0.0f);
-    reset();
-}
-
-void PitchCorrector::reset()
-{
-    std::fill (inBuf.begin(),  inBuf.end(),  0.0f);
-    std::fill (outBuf.begin(), outBuf.end(), 0.0f);
-    writePos = 0;
-    readPos = 0;
-    phase = 0.0f;
-    currentRatio = 1.0f;
-    lastDetected = lastTarget = 0.0f;
-}
-
-/** Nearest in-scale note to the detected pitch. */
-float PitchCorrector::snapToScale (float hz) const noexcept
-{
-    if (hz <= 0.0f) return 0.0f;
-
-    const float midi = 69.0f + 12.0f * std::log2 (hz / 440.0f);
-    const auto& steps = scaleSteps (scale);
-
-    float best = midi;
-    float bestDist = 1.0e9f;
-
-    // search a couple of octaves either side of the detected note
-    const int baseOct = (int) std::floor ((midi - (float) root) / 12.0f);
-    for (int oct = baseOct - 1; oct <= baseOct + 1; ++oct)
-        for (int st : steps)
-        {
-            const float cand = (float) root + 12.0f * (float) oct + (float) st;
-            const float d = std::abs (cand - midi);
-            if (d < bestDist) { bestDist = d; best = cand; }
-        }
-
-    return 440.0f * std::pow (2.0f, (best - 69.0f) / 12.0f);
-}
-
-void PitchCorrector::process (float* mono, int numSamples)
-{
-    const int ringLen = (int) inBuf.size();
-    const int mask = ringLen - 1;
-
-    for (int n = 0; n < numSamples; ++n)
-    {
-        inBuf[(size_t) writePos] = mono[n];
-
-        mono[n] = outBuf[(size_t) writePos];
-        outBuf[(size_t) writePos] = 0.0f;
-
-        writePos = (writePos + 1) & mask;
-
-        // Re-estimate pitch once per frameSize/4 samples
-        if ((writePos % (frameSize / 4)) == 0)
-        {
-            std::vector<float> frame ((size_t) frameSize);
-            const int start = (writePos - frameSize + ringLen) & mask;
-            for (int i = 0; i < frameSize; ++i)
-                frame[(size_t) i] = inBuf[(size_t) ((start + i) & mask)];
-
-            float conf = 0.0f;
-            const float f0 = tracker.process (frame.data(), &conf);
-
-            if (f0 > 0.0f && conf > 0.5f)
-            {
-                lastDetected = f0;
-                lastTarget   = snapToScale (f0);
-
-                const float fullRatio = lastTarget / f0;
-                // strength blends between untouched and fully snapped
-                const float wanted = std::pow (fullRatio, strength);
-
-                // retune speed: how fast we slew toward the wanted ratio
-                const float coef = timeCoef (retuneMs, sr / (frameSize / 4));
-                currentRatio = coef * currentRatio + (1.0f - coef) * wanted;
-            }
-            else
-            {
-                // unvoiced: drift back to unity so consonants pass clean
-                currentRatio = 0.85f * currentRatio + 0.15f * 1.0f;
-            }
-        }
-
-        // --- PSOLA grain scheduling -----------------------------------------
-        // Synthesis marks are spaced period/ratio apart; each grain is copied
-        // verbatim from the input, so the spectral envelope (formants) is
-        // untouched by construction.
-        if (lastDetected > 0.0f)
-        {
-            const float period = (float) sr / lastDetected;
-            const float synthPeriod = std::max (16.0f, period / std::max (currentRatio, 0.25f));
-
-            phase += 1.0f;
-            if (phase >= synthPeriod)
-            {
-                phase -= synthPeriod;
-
-                const int grainLen = std::min ((int) (period * 2.0f), ringLen / 4);
-                if (grainLen > 8)
-                {
-                    // grain centred one period back so it's fully buffered
-                    const int centre = (writePos - (int) period + ringLen) & mask;
-                    const int begin  = (centre - grainLen / 2 + ringLen) & mask;
-
-                    for (int i = 0; i < grainLen; ++i)
-                    {
-                        const float w = 0.5f - 0.5f * std::cos (
-                            2.0f * juce::MathConstants<float>::pi * (float) i / (float) (grainLen - 1));
-                        const int src = (begin + i) & mask;
-                        const int dst = (writePos + i - grainLen / 2 + ringLen) & mask;
-                        outBuf[(size_t) dst] += inBuf[(size_t) src] * w;
-                    }
-                }
-            }
-        }
-        else
-        {
-            // no pitch: pass through so breaths and consonants stay intact
-            outBuf[(size_t) writePos] += inBuf[(size_t) writePos];
-        }
-    }
 }
 
 //==============================================================================
@@ -322,6 +166,7 @@ void EffectsChain::prepare (double sampleRate, int maxBlockSize, int numChannels
 
     doubleBuf.setSize (2, (int) (sampleRate * 0.15) + 4);
     dryCopy.setSize (std::max (2, channels), std::max (512, maxBlockSize));
+    baseRetuneMs = 40.0f; baseStrength = 0.8f;
 
     juce::dsp::ProcessSpec spec { sampleRate, (juce::uint32) maxBlockSize, 1 };
     for (int ch = 0; ch < 2; ++ch)
@@ -359,11 +204,10 @@ void EffectsChain::applyAnalysis (const AnalysisResult& a)
     // Retune speed from how unstable the performance actually was: a singer
     // who is already close to pitch gets gentle correction, a wobbly one gets
     // tighter correction. This is the "pick a sensible value" call.
-    const float instability = std::clamp (a.pitchStabilityCents / 50.0f, 0.0f, 1.0f);
-    const float retune = juce::jmap (instability, 90.0f, 12.0f);
-    tuner.setRetuneMs (retune);
-    tuner.setStrength (juce::jmap (instability, 0.55f, 0.95f));
-    tuner.setFormantPreserve (true);
+    baseRetuneMs = juce::jmap (std::clamp (a.pitchStabilityCents / 50.0f, 0.0f, 1.0f),
+                               90.0f, 12.0f);
+    baseStrength = juce::jmap (std::clamp (a.pitchStabilityCents / 50.0f, 0.0f, 1.0f),
+                               0.55f, 0.95f);
 
     drive = a.saturationDrive;
     // dull sources get more air, already-bright ones get less
@@ -383,6 +227,13 @@ void EffectsChain::setTempo (double bpm, bool valid)
 
 void EffectsChain::updateFromTrims()
 {
+    // TUNE scales both retune speed and strength around the derived values:
+    // turning it up tightens correction, down loosens it toward untouched.
+    const float t = juce::jlimit (0.0f, 2.0f, trims.tuneAmount);
+    tuner.setRetuneMs (baseRetuneMs / juce::jmax (0.25f, t));
+    tuner.setStrength (juce::jlimit (0.0f, 1.0f, baseStrength * t));
+    tuner.setDeadZoneCents (0.0f);   // the effects-half tuner snaps everything
+
     delay.setMix   (bypass.delay  ? 0.0f : 0.18f * trims.delayMix);
     delay.setDuck  (trims.duckAmount);
     reverb.setMix  (bypass.reverb ? 0.0f : 0.16f * trims.reverbMix);
@@ -391,7 +242,9 @@ void EffectsChain::updateFromTrims()
 
 int EffectsChain::getLatencySamples() const noexcept
 {
-    return bypass.autoTune ? 0 : tuner.getLatencySamples();
+    // Nothing runs before a LISTEN pass, so nothing is delayed either.
+    if (! haveAnalysis || bypass.autoTune) return 0;
+    return tuner.getLatencySamples();
 }
 
 void EffectsChain::process (juce::AudioBuffer<float>& buffer)
@@ -470,8 +323,8 @@ void EffectsChain::process (juce::AudioBuffer<float>& buffer)
             {
                 const float hi = exciterHp[ch].processSample (p[i]);
                 // asymmetric shaping adds even harmonics above the HP corner
-                const float harm = hi * std::abs (hi) * 2.0f;
-                p[i] += harm * exciterAmount * 0.5f;
+                const float harm = hi * std::abs (hi);
+                p[i] += harm * exciterAmount * 0.35f;
             }
         }
     }

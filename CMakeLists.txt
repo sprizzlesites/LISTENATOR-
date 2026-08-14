@@ -59,6 +59,7 @@ target_sources(LISTENATOR PRIVATE
     Source/Analysis/PitchTracker.cpp
     Source/DSP/CleanupChain.cpp
     Source/DSP/EffectsChain.cpp
+    Source/DSP/PitchCorrector.cpp
     Source/UI/DoofLookAndFeel.cpp
     Source/UI/DoofArt.cpp
     Source/UI/MachinePanel.cpp)
@@ -109,6 +110,7 @@ if(LISTENATOR_BUILD_UIRENDER)
         Source/Analysis/PitchTracker.cpp
         Source/DSP/CleanupChain.cpp
         Source/DSP/EffectsChain.cpp
+        Source/DSP/PitchCorrector.cpp
         Source/UI/DoofLookAndFeel.cpp
         Source/UI/DoofArt.cpp
         Source/UI/MachinePanel.cpp)
@@ -130,4 +132,32 @@ if(LISTENATOR_BUILD_UIRENDER)
             comctl32 comdlg32 shlwapi rpcrt4 gdi32 user32 shell32 advapi32
             ws2_32 wininet)
     endif()
+endif()
+
+# ---------------------------------------------------------------------------
+# DSP verification harness — measures the processed audio against what the
+# analysis said it would do. Native build only.
+# ---------------------------------------------------------------------------
+if(LISTENATOR_BUILD_TESTS)
+    juce_add_console_app(DspTest PRODUCT_NAME "DspTest")
+    target_sources(DspTest PRIVATE
+        tools/dsptest.cpp
+        Source/PluginProcessor.cpp
+        Source/PluginEditor.cpp
+        Source/Analysis/VocalAnalyzer.cpp
+        Source/Analysis/PitchTracker.cpp
+        Source/DSP/CleanupChain.cpp
+        Source/DSP/EffectsChain.cpp
+        Source/DSP/PitchCorrector.cpp
+        Source/UI/DoofLookAndFeel.cpp
+        Source/UI/DoofArt.cpp
+        Source/UI/MachinePanel.cpp)
+    target_include_directories(DspTest PRIVATE Source)
+    target_compile_definitions(DspTest PUBLIC
+        JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0
+        JUCE_DISPLAY_SPLASH_SCREEN=0 JUCE_REPORT_APP_USAGE=0
+        JUCE_STANDALONE_APPLICATION=1 JUCE_MODAL_LOOPS_PERMITTED=1)
+    target_link_libraries(DspTest
+        PRIVATE juce::juce_audio_utils juce::juce_dsp
+        PUBLIC juce::juce_recommended_config_flags)
 endif()

@@ -55,10 +55,12 @@ private:
     void computePitchStats   (AnalysisResult&);
     void computeFormants     (AnalysisResult&);
     void computeSibilance    (AnalysisResult&);
+    void measureSibilantLevel (AnalysisResult&);
     void computeResonances   (AnalysisResult&);
     void computeReverb       (AnalysisResult&);
     void computeLoudness     (AnalysisResult&);
     void deriveSettings      (AnalysisResult&);
+    void solveToneFilterGains (AnalysisResult&) const;
 
     double sr = 44100.0;
 
@@ -86,8 +88,8 @@ private:
 
     std::vector<float> fftScratch;                 // 2 * fftSize
     std::vector<float> avgPower;                   // fftSize/2 magnitudes
-    std::vector<std::vector<float>> frameBandDb;   // per-frame 1/3-octave energies
     std::vector<float> sibilantAvgPower;
+    std::vector<float> noisePower;
     PitchTracker pitchTracker;
     std::vector<float> f0Track;
 

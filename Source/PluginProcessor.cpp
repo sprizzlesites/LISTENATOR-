@@ -69,6 +69,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout ListenatorProcessor::createL
     bp (pid::bpSurgical, "Bypass Surgical");   bp (pid::bpResonance,"Bypass Resonance");
     bp (pid::bpDeEss,    "Bypass De-Ess");     bp (pid::bpComp,     "Bypass Comp");
     bp (pid::bpTone,     "Bypass Tone");       bp (pid::bpLimiter,  "Bypass Limiter");
+    bp (pid::bpPitchRepair, "Bypass Pitch Repair");
 
     bp (pid::bpAutoTune,  "Bypass Tune");      bp (pid::bpDoubler,  "Bypass Doubler");
     bp (pid::bpSaturation,"Bypass Sat");       bp (pid::bpExciter,  "Bypass Exciter");
@@ -118,6 +119,9 @@ void ListenatorProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
 
     monoScratch.setSize (1, samplesPerBlock);
 
+    outputLimiter.prepare (sampleRate, samplesPerBlock, outCh);
+    outputLimiter.setThresholdDb (-0.5f);
+
     setLatencySamples (cleanup.getLatencySamples() + effects.getLatencySamples());
 }
 
@@ -125,6 +129,7 @@ void ListenatorProcessor::releaseResources()
 {
     cleanup.reset();
     effects.reset();
+    outputLimiter.reset();
     analyzer.reset();
 }
 
@@ -157,6 +162,7 @@ void ListenatorProcessor::pullParameters()
     cb.compressor = flag (pid::bpComp);
     cb.toneMatch  = flag (pid::bpTone);
     cb.limiter    = flag (pid::bpLimiter);
+    cb.pitchRepair = flag (pid::bpPitchRepair);
 
     CleanupTrims ct;
     ct.eqAmount      = raw (pid::eqAmount);
@@ -265,6 +271,13 @@ void ListenatorProcessor::processBlock (juce::AudioBuffer<float>& buffer,
     const float outGain = juce::Decibels::decibelsToGain (
         apvts.getRawParameterValue (pid::outputGain)->load());
     buffer.applyGain (outGain);
+
+    // Everything downstream of the cleanup half's limiter -- saturation, the
+    // doubler, both sends, the output trim -- can push back over full scale,
+    // so the last word belongs here. Skipped when both halves are off, so
+    // "bypass everything" really is bit-transparent.
+    if (! (skipCleanup && skipEffects))
+        outputLimiter.process (buffer);
 
     outputLevelDb.store (juce::Decibels::gainToDecibels (
         buffer.getMagnitude (0, numSamples), -100.0f));

@@ -1,7 +1,7 @@
 #pragma once
 #include <juce_dsp/juce_dsp.h>
 #include "Analysis/AnalysisResult.h"
-#include "Analysis/PitchTracker.h"
+#include "PitchCorrector.h"
 
 namespace listenator
 {
@@ -22,54 +22,6 @@ struct EffectsTrims
     float delayMix     = 1.0f;
     float reverbMix    = 1.0f;
     float duckAmount   = 1.0f;
-};
-
-/** Musical scales the autotune can snap to. Key is chosen manually. */
-enum class Scale { chromatic = 0, major, minor, harmonicMinor, pentatonicMajor, pentatonicMinor };
-
-//==============================================================================
-/** Formant-preserving pitch correction.
-
-    Two instances exist in the plugin: one in the cleanup half configured for
-    slow, inaudible intonation repair, and one here in the effects half whose
-    retune speed is derived from how unstable the performance actually was.
-
-    PSOLA on the detected period, with a cepstral-envelope correction so the
-    formants stay put and the voice doesn't turn into a chipmunk.
-*/
-class PitchCorrector
-{
-public:
-    void prepare (double sampleRate, int maxBlockSize);
-    void reset();
-
-    void setKey (int rootNote, Scale s) noexcept { root = rootNote; scale = s; }
-    void setRetuneMs (float ms) noexcept         { retuneMs = ms; }
-    void setStrength (float s) noexcept          { strength = juce::jlimit (0.0f, 1.0f, s); }
-    void setFormantPreserve (bool b) noexcept    { preserveFormants = b; }
-
-    void process (float* mono, int numSamples);
-
-    float getDetectedHz() const noexcept  { return lastDetected; }
-    float getTargetHz()   const noexcept  { return lastTarget; }
-    int   getLatencySamples() const noexcept { return frameSize; }
-
-private:
-    float snapToScale (float hz) const noexcept;
-
-    static constexpr int frameSize = 1024;
-
-    double sr = 44100.0;
-    int    root = 0;
-    Scale  scale = Scale::chromatic;
-    float  retuneMs = 40.0f, strength = 1.0f;
-    bool   preserveFormants = true;
-
-    PitchTracker tracker;
-    std::vector<float> inBuf, outBuf, window;
-    int   writePos = 0, readPos = 0;
-    float currentRatio = 1.0f, lastDetected = 0.0f, lastTarget = 0.0f;
-    float phase = 0.0f;
 };
 
 //==============================================================================
@@ -127,7 +79,7 @@ public:
     void reset();
 
     void applyAnalysis (const AnalysisResult&);
-    void setBypass (const EffectsBypass& b) { bypass = b; }
+    void setBypass (const EffectsBypass& b) { bypass = b; updateFromTrims(); }
     void setTrims  (const EffectsTrims& t)  { trims = t; updateFromTrims(); }
     void setKey (int root, Scale s);
     void setTempo (double bpm, bool valid);
@@ -149,6 +101,7 @@ private:
     EffectsTrims   trims;
 
     PitchCorrector tuner;
+    float baseRetuneMs = 40.0f, baseStrength = 0.8f;
 
     // doubler: two short, slightly detuned taps panned apart
     juce::AudioBuffer<float> doubleBuf;

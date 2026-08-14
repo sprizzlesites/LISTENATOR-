@@ -44,6 +44,7 @@ namespace pid
     inline constexpr const char* bpComp      = "bpComp";
     inline constexpr const char* bpTone      = "bpTone";
     inline constexpr const char* bpLimiter   = "bpLimiter";
+    inline constexpr const char* bpPitchRepair = "bpPitchRepair";
 
     inline constexpr const char* bpAutoTune   = "bpAutoTune";
     inline constexpr const char* bpDoubler    = "bpDoubler";
@@ -120,6 +121,11 @@ private:
     bool analysisApplied = false;
 
     juce::AudioBuffer<float> monoScratch;
+
+    // Final safety limiter, after BOTH halves and the output trim. The
+    // cleanup half's limiter only protects its own output; the effects half
+    // adds saturation, doubling and sends on top of it.
+    BrickwallLimiter outputLimiter;
 
     std::atomic<float> inputLevelDb  { -100.0f };
     std::atomic<float> outputLevelDb { -100.0f };

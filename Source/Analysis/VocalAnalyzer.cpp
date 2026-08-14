@@ -104,6 +104,7 @@ void VocalAnalyzer::prepare (double sampleRate, int)
     fftScratch.assign ((size_t) fftSize * 2, 0.0f);
     avgPower.assign ((size_t) fftSize / 2, 0.0f);
     sibilantAvgPower.assign ((size_t) fftSize / 2, 0.0f);
+    noisePower.assign ((size_t) fftSize / 2, 0.0f);
     pitchTracker.prepare (sampleRate, 2048);
     reset();
 }
@@ -219,7 +220,6 @@ void VocalAnalyzer::powerToBands (const std::vector<float>& power,
 void VocalAnalyzer::computeLtasAndNoise (AnalysisResult& r)
 {
     std::fill (avgPower.begin(), avgPower.end(), 0.0f);
-    frameBandDb.clear();
 
     std::vector<float> frameRmsDb;
     int numFrames = 0;
@@ -248,10 +248,6 @@ void VocalAnalyzer::computeLtasAndNoise (AnalysisResult& r)
             avgPower[(size_t) i]  += p;
         }
 
-        std::array<float, numToneBands> bands {};
-        powerToBands (framePower, bands);
-        frameBandDb.emplace_back (bands.begin(), bands.end());
-
         ++numFrames;
     }
 
@@ -265,6 +261,40 @@ void VocalAnalyzer::computeLtasAndNoise (AnalysisResult& r)
     r.noiseFloorDb = percentile (frameRmsDb, 0.05f);
     const float speechDb = percentile (frameRmsDb, 0.90f);
     r.snrDb = speechDb - r.noiseFloorDb;
+
+    // Second pass over the quiet frames only, to get the SHAPE of the noise.
+    // Spectral subtraction needs the noise spectrum; handing it the full-signal
+    // LTAS instead makes it subtract the vocal from itself.
+    std::fill (noisePower.begin(), noisePower.end(), 0.0f);
+    const float quietCutDb = r.noiseFloorDb + 3.0f;
+    int noiseFrames = 0, frameIdx = 0;
+
+    for (int start = 0; start + fftSize <= captureLen; start += hopSize, ++frameIdx)
+    {
+        if (frameIdx >= (int) frameRmsDb.size() || frameRmsDb[(size_t) frameIdx] > quietCutDb)
+            continue;
+
+        std::fill (fftScratch.begin(), fftScratch.end(), 0.0f);
+        std::memcpy (fftScratch.data(), capture.data() + start,
+                     sizeof (float) * (size_t) fftSize);
+        window.multiplyWithWindowingTable (fftScratch.data(), (size_t) fftSize);
+        fft.performFrequencyOnlyForwardTransform (fftScratch.data());
+
+        for (int i = 0; i < fftSize / 2; ++i)
+            noisePower[(size_t) i] += fftScratch[(size_t) i] * fftScratch[(size_t) i];
+        ++noiseFrames;
+    }
+
+    if (noiseFrames > 0)
+    {
+        for (auto& v : noisePower) v /= (float) noiseFrames;
+        powerToBands (noisePower, r.noiseLtasDb);
+    }
+    else
+    {
+        // No frame was quiet enough to profile: assume a flat floor.
+        r.noiseLtasDb.fill (r.noiseFloorDb);
+    }
 }
 
 /** ITU-R BS.1770 K-weighted loudness, plus crest factor and loudness range. */
@@ -514,16 +544,23 @@ void VocalAnalyzer::computeSibilance (AnalysisResult& r)
 
     for (auto& p : sibilantAvgPower) p /= (float) count;
 
+    // Pick the peak of the RATIO against the overall average spectrum, not of
+    // raw energy. A vocal spectrum falls with frequency, so a raw peak search
+    // lands at the low edge of the search window almost every time; the ratio
+    // isolates what is actually different about the sibilant frames.
     int   peakBin = loBin;
-    float peakVal = -1.0f;
+    float peakRatio = -1.0f;
     for (int i = loBin; i <= hiBin; ++i)
-        if (sibilantAvgPower[(size_t) i] > peakVal)
-        { peakVal = sibilantAvgPower[(size_t) i]; peakBin = i; }
+    {
+        const float ref = std::max (avgPower[(size_t) i], 1.0e-20f);
+        const float ratio = sibilantAvgPower[(size_t) i] / ref;
+        if (ratio > peakRatio) { peakRatio = ratio; peakBin = i; }
+    }
 
     r.deEssCentreHz = binToHz (peakBin);
 
     // -6 dB width of the sibilant hump sets the filter Q
-    const float half = peakVal * 0.25f;
+    const float half = sibilantAvgPower[(size_t) peakBin] * 0.25f;
     int lo = peakBin, hi = peakBin;
     while (lo > loBin && sibilantAvgPower[(size_t) lo] > half) --lo;
     while (hi < hiBin && sibilantAvgPower[(size_t) hi] > half) ++hi;
@@ -532,10 +569,64 @@ void VocalAnalyzer::computeSibilance (AnalysisResult& r)
     const float hiHz = std::max (binToHz (hi), loHz * 1.05f);
     r.deEssBandwidthOct = std::clamp (std::log2 (hiHz / loHz), 0.5f, 2.5f);
 
-    // Threshold sits just under the typical sibilant level so only the loud
-    // ones get caught, not every consonant.
-    if (! sibLevels.empty())
-        r.deEssThresholdDb = percentile (sibLevels, 0.35f);
+    // The threshold has to be in the same units the de-esser's detector works
+    // in -- peak amplitude of the filtered signal, in dBFS. Taking it from raw
+    // FFT magnitudes (as an earlier version did) is off by tens of dB, because
+    // an unnormalised N-point FFT of a windowed frame lives on a completely
+    // different scale from the samples themselves. So: actually filter the
+    // captured audio and measure the envelope we will really be looking at.
+    measureSibilantLevel (r);
+}
+
+/** Run the capture through the chosen sibilant band and take percentiles of
+    the resulting envelope, in dBFS. */
+void VocalAnalyzer::measureSibilantLevel (AnalysisResult& r)
+{
+    juce::dsp::LinkwitzRileyFilter<float> hp;
+    juce::dsp::ProcessSpec spec { sr, 512, 1 };
+    hp.prepare (spec);
+    hp.setType (juce::dsp::LinkwitzRileyFilterType::highpass);
+    hp.setCutoffFrequency (std::clamp (r.deEssCentreHz * 0.72f, 2500.0f, 9000.0f));
+    hp.reset();
+
+    // 5 ms peak envelope, matching the de-esser's fast detector
+    const int   win = std::max (16, (int) (0.005 * sr));
+    std::vector<float> envDb;
+    envDb.reserve ((size_t) (captureLen / win + 1));
+
+    float running = 0.0f;
+    int   n = 0;
+
+    for (int i = 0; i < captureLen; ++i)
+    {
+        const float y = std::abs (hp.processSample (0, capture[(size_t) i]));
+        running = std::max (running, y);
+
+        if (++n >= win)
+        {
+            envDb.push_back (running > 1.0e-9f ? 20.0f * std::log10 (running) : kMinDb);
+            running = 0.0f;
+            n = 0;
+        }
+    }
+
+    if (envDb.empty())
+        return;
+
+    // Sibilant bursts are a small minority of frames -- often under 10% -- so a
+    // percentile like p92 lands in the gap between the body's HF content and
+    // the esses themselves and reads far too low. Take the peak from well
+    // inside the sibilant population, and the reference from the body.
+    const float sibPeak  = percentile (envDb, 0.995f);
+    const float bodyHf   = percentile (envDb, 0.50f);
+    const float spread   = std::max (0.0f, sibPeak - bodyHf);
+
+    // Threshold sits proportionally below the peak: the spikier the sibilance,
+    // the further down it has to reach to catch the whole ess.
+    r.deEssThresholdDb = std::clamp (sibPeak - std::clamp (spread * 0.45f, 3.0f, 14.0f),
+                                     -60.0f, -6.0f);
+    r.sibilantPeakDb   = sibPeak;
+    r.sibilantSpreadDb = spread;
 }
 
 /** Resonances = where the spectrum pokes above its own local envelope. */
@@ -715,28 +806,35 @@ void VocalAnalyzer::deriveSettings (AnalysisResult& r)
     // literature: peaky signals want faster attack and slower release.
     const float crest = std::clamp (r.crestFactorDb, 6.0f, 30.0f);
 
-    // Stage 1: slow leveller, tames long-term inconsistency (loudness range)
-    r.compLevelThreshDb  = r.integratedLufs + 2.0f;
+    // Stage 1: slow leveller against an RMS detector, so its threshold is
+    // directly comparable to the measured integrated loudness. Sitting it
+    // slightly BELOW the programme level is what makes it level rather than
+    // just catch occasional peaks.
+    r.compLevelThreshDb  = r.integratedLufs - 3.0f;
     r.compLevelRatio     = std::clamp (1.0f + r.loudnessRangeDb / 8.0f, 1.5f, 4.0f);
     r.compLevelAttackMs  = std::clamp (60.0f - crest, 15.0f, 60.0f);
     r.compLevelReleaseMs = std::clamp (crest * 20.0f, 150.0f, 600.0f);
 
-    // Stage 2: fast peak control, catches the transients stage 1 lets through
-    r.compPeakThreshDb  = r.integratedLufs + std::clamp (crest * 0.45f, 4.0f, 12.0f);
+    // Stage 2: fast peak control against a peak detector. Its threshold has to
+    // live on the peak scale, which sits a crest factor above the RMS one.
+    r.compPeakThreshDb  = r.integratedLufs + std::clamp (crest * 0.55f, 4.0f, 14.0f);
     r.compPeakRatio     = std::clamp (2.0f + crest / 6.0f, 2.5f, 6.0f);
     r.compPeakAttackMs  = std::clamp (60.0f / crest, 1.0f, 15.0f);
     r.compPeakReleaseMs = std::clamp (crest * 6.0f, 40.0f, 200.0f);
 
-    // makeup restores what the two stages statistically remove
-    const float est1 = std::max (0.0f, (r.integratedLufs - r.compLevelThreshDb))
+    // Makeup restores what the stages remove at a typical loud moment, not at
+    // the mean: estimating at the mean gives zero whenever the threshold sits
+    // above it, which is exactly when makeup is needed most.
+    const float loudRms  = r.integratedLufs + r.loudnessRangeDb * 0.5f;
+    const float est1 = std::max (0.0f, loudRms - r.compLevelThreshDb)
                      * (1.0f - 1.0f / r.compLevelRatio);
-    const float est2 = std::max (0.0f, (r.peakDb - r.compPeakThreshDb))
-                     * (1.0f - 1.0f / r.compPeakRatio) * 0.35f;
-    r.makeupGainDb = std::clamp (est1 + est2, 0.0f, 18.0f);
+    const float est2 = std::max (0.0f, r.peakDb - r.compPeakThreshDb)
+                     * (1.0f - 1.0f / r.compPeakRatio) * 0.5f;
+    r.makeupGainDb = std::clamp (est1 + est2, 0.0f, 12.0f);
 
-    // ---- de-esser reduction depth from how hot the sibilance actually is ---
-    r.deEssMaxReductionDb = -std::clamp ((r.deEssThresholdDb - r.noiseFloorDb) * 0.15f,
-                                         3.0f, 12.0f);
+    // ---- de-esser depth from how far the loud esses overshoot the threshold
+    // Depth follows how far the esses stick out of the body, not a fixed value.
+    r.deEssMaxReductionDb = -std::clamp (r.sibilantSpreadDb * 0.35f, 3.0f, 12.0f);
 
     // ---- saturation: dull/thin sources want more, bright ones want less ----
     {
@@ -781,6 +879,70 @@ void VocalAnalyzer::deriveSettings (AnalysisResult& r)
         r.toneMatchDb[(size_t) b] =
             (raw[(size_t) a] + raw[(size_t) b] + raw[(size_t) c]) / 3.0f;
     }
+
+    solveToneFilterGains (r);
+}
+
+/** Adjacent 1/3-octave peaking filters overlap, so a cascade of them does NOT
+    produce the curve you dialled in -- each band gets its own gain plus the
+    skirts of its neighbours, and the result overshoots.
+
+    Solve M * g = target, where M[i][j] is the dB that a 1 dB filter on band j
+    contributes at band i's centre. Gauss-Seidel converges in a few sweeps
+    because M is strongly diagonally dominant. Done here on the analysis
+    thread so the audio thread never sees the cost. */
+void VocalAnalyzer::solveToneFilterGains (AnalysisResult& r) const
+{
+    // A 1/3-octave bandwidth corresponds to Q ~ 4.32.
+    const float p = std::pow (2.0f, 1.0f / 3.0f);
+    const float q = std::sqrt (p) / (p - 1.0f);
+
+    std::array<std::array<float, numToneBands>, numToneBands> m {};
+
+    for (int j = 0; j < numToneBands; ++j)
+    {
+        const float f0 = toneBandHz[(size_t) j];
+        if (f0 >= sr * 0.45)
+        {
+            m[(size_t) j][(size_t) j] = 1.0f;
+            continue;
+        }
+
+        // response of a +1 dB peaking filter on band j
+        auto c = juce::dsp::IIR::Coefficients<float>::makePeakFilter (
+                     sr, f0, q, std::pow (10.0f, 1.0f / 20.0f));
+
+        for (int i = 0; i < numToneBands; ++i)
+        {
+            const float fi = toneBandHz[(size_t) i];
+            if (fi >= sr * 0.45) continue;
+            const float mag = (float) c->getMagnitudeForFrequency (fi, sr);
+            m[(size_t) i][(size_t) j] = mag > 0.0f ? 20.0f * std::log10 (mag) : 0.0f;
+        }
+    }
+
+    std::array<float, numToneBands> g {};
+    g.fill (0.0f);
+
+    for (int iter = 0; iter < 40; ++iter)
+    {
+        for (int i = 0; i < numToneBands; ++i)
+        {
+            const float diag = m[(size_t) i][(size_t) i];
+            if (std::abs (diag) < 1.0e-4f) { g[(size_t) i] = 0.0f; continue; }
+
+            float sum = 0.0f;
+            for (int j = 0; j < numToneBands; ++j)
+                if (j != i) sum += m[(size_t) i][(size_t) j] * g[(size_t) j];
+
+            const float want = (r.toneMatchDb[(size_t) i] - sum) / diag;
+            // damped update keeps the sweep stable on the wide low bands
+            g[(size_t) i] = std::clamp (g[(size_t) i] + 0.7f * (want - g[(size_t) i]),
+                                        -12.0f, 12.0f);
+        }
+    }
+
+    r.toneFilterGainDb = g;
 }
 
 } // namespace listenator

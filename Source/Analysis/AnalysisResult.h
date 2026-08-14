@@ -71,6 +71,8 @@ struct AnalysisResult
     float deEssBandwidthOct = 1.2f;
     float deEssThresholdDb = -28.0f;
     float deEssMaxReductionDb = -8.0f;
+    float sibilantPeakDb  = -20.0f;   // dBFS, band-filtered envelope
+    float sibilantSpreadDb = 12.0f;   // how far esses stick out of the body
 
     // two compressor stages: slow leveller then fast peak control
     float compLevelThreshDb = -24.0f, compLevelRatio = 2.0f;
@@ -83,7 +85,12 @@ struct AnalysisResult
 
     std::vector<Resonance> resonances;              // surgical notches
     std::array<float, numToneBands> measuredLtasDb {};  // what came in
-    std::array<float, numToneBands> toneMatchDb    {};  // correction to apply
+    std::array<float, numToneBands> noiseLtasDb    {};  // spectrum of the quiet frames
+    std::array<float, numToneBands> toneMatchDb    {};  // correction we want
+    /** Per-filter gains that actually PRODUCE toneMatchDb once the overlap
+        between neighbouring 1/3-octave peaking filters is accounted for.
+        Solved on the analysis thread; the audio thread just uses them. */
+    std::array<float, numToneBands> toneFilterGainDb {};
 
     // ---- host-derived -----------------------------------------------------
     double tempoBpm = 120.0;
