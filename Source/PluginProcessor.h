@@ -105,6 +105,8 @@ public:
     float getPlosiveReductionDb() const noexcept { return cleanup.getPlosiveReductionDb(); }
     int   getDeclippedCount() const noexcept     { return cleanup.getDeclippedCount(); }
     float getPlosivePeakBoost() const noexcept   { return cleanup.getPlosivePeakBoost(); }
+    float getResonanceReductionDb() const noexcept { return cleanup.getResonanceReductionDb(); }
+    int   getResonanceBinCount()    const noexcept { return cleanup.getResonanceBinCount(); }
 
     /** Copy of the last published analysis, for the UI readouts. */
     const AnalysisResult& getAnalysisResult() const noexcept { return lastResult; }

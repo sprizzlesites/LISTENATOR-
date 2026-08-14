@@ -18,6 +18,17 @@ static constexpr std::array<float, numToneBands> toneBandHz {
     5000.f, 6300.f, 8000.f, 10000.f,12500.f,16000.f,20000.f
 };
 
+/** Target long-term average spectrum for a professionally mixed lead vocal, in
+    dB relative to the 200 Hz-2 kHz average. Lives here rather than inside the
+    analyser so the verification harness can check the OUTPUT against the same
+    curve the correction was derived from. */
+inline constexpr std::array<float, numToneBands> kTargetLtasDb {
+    -42.0f, -38.0f, -34.0f, -29.0f, -24.0f, -18.0f, -12.0f,  -7.0f,  // 20..100
+     -3.5f,  -1.5f,  -0.5f,   0.0f,   0.3f,   0.3f,   0.0f,  -0.8f,  // 125..630
+     -1.8f,  -2.8f,  -3.8f,  -4.8f,  -5.4f,  -5.8f,  -6.0f,  -6.6f,  // 800..4k
+     -8.5f, -10.5f, -13.0f, -16.0f, -19.5f, -24.0f, -32.0f           // 5k..20k
+};
+
 /** A static notch the surgical EQ should apply, derived from resonance detection. */
 struct Resonance
 {
@@ -98,6 +109,10 @@ struct AnalysisResult
         between neighbouring 1/3-octave peaking filters is accounted for.
         Solved on the analysis thread; the audio thread just uses them. */
     std::array<float, numToneBands> toneFilterGainDb {};
+    /** The same solve done on the assumption the surgical notches are bypassed.
+        Their skirts reach into neighbouring bands, so a set of gains solved
+        around them is wrong the moment they are switched off. */
+    std::array<float, numToneBands> toneFilterGainDbNoNotch {};
 
     // ---- host-derived -----------------------------------------------------
     double tempoBpm = 120.0;

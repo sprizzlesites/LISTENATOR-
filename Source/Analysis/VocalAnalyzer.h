@@ -61,6 +61,12 @@ private:
     void computeLoudness     (AnalysisResult&);
     void deriveSettings      (AnalysisResult&);
     void solveToneFilterGains (AnalysisResult&) const;
+    void solveToneGainsInto (const AnalysisResult&, bool withNotches,
+                             std::array<float, numToneBands>&) const;
+    /** Response of the stages that reshape the spectrum downstream of where the
+        tone target is computed, so the solve can cancel them. */
+    void accumulateChainResponse (const AnalysisResult&,
+                                  std::array<float, numToneBands>&) const;
 
     double sr = 44100.0;
 

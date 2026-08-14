@@ -167,6 +167,121 @@ float measureModulationDepth (const std::vector<float>& x, double sr)
     return (float) (std::sqrt (acc / n) / mean);
 }
 
+/** 1/3-octave LTAS of a signal, normalised the same way the analyser does
+    (aligned on the 200 Hz - 2 kHz average) so it can be compared band for band
+    against the target the correction was derived from. */
+std::array<float, numToneBands> measureLtas (const std::vector<float>& x, double sr)
+{
+    constexpr int order = 12, size = 1 << order;
+    juce::dsp::FFT fft (order);
+    juce::dsp::WindowingFunction<float> win ((size_t) size,
+                                             juce::dsp::WindowingFunction<float>::hann);
+    std::vector<float> acc ((size_t) size / 2, 0.0f), scratch ((size_t) size * 2);
+    int frames = 0;
+
+    // Only frames carrying signal: silence would drag the average toward the
+    // noise floor and make the curve look nothing like the performance.
+    float peak = 0.0f;
+    for (float v : x) peak = std::max (peak, std::abs (v));
+    const float floorLevel = peak * 0.02f;
+
+    for (size_t st = 0; st + (size_t) size <= x.size(); st += (size_t) size / 2)
+    {
+        float framePeak = 0.0f;
+        for (int k = 0; k < size; ++k) framePeak = std::max (framePeak, std::abs (x[st + (size_t) k]));
+        if (framePeak < floorLevel) continue;
+
+        std::fill (scratch.begin(), scratch.end(), 0.0f);
+        std::copy (x.begin() + (long) st, x.begin() + (long) st + size, scratch.begin());
+        win.multiplyWithWindowingTable (scratch.data(), (size_t) size);
+        fft.performFrequencyOnlyForwardTransform (scratch.data());
+        for (int b = 0; b < size / 2; ++b) acc[(size_t) b] += scratch[(size_t) b] * scratch[(size_t) b];
+        ++frames;
+    }
+
+    std::array<float, numToneBands> out {};
+    if (frames == 0) { out.fill (-120.0f); return out; }
+    for (auto& v : acc) v /= (float) frames;
+
+    for (int b = 0; b < numToneBands; ++b)
+    {
+        const float fc = toneBandHz[(size_t) b];
+        const int lo = std::max (1, (int) std::floor (fc / 1.122462f * size / sr));
+        const int hi = std::min ((int) acc.size() - 1, (int) std::ceil (fc * 1.122462f * size / sr));
+        float sum = 0.0f; int n = 0;
+        for (int i = lo; i <= hi; ++i) { sum += acc[(size_t) i]; ++n; }
+        out[(size_t) b] = n > 0 && sum > 0.0f ? 10.0f * std::log10 (sum / (float) n) : -120.0f;
+    }
+
+    float ref = 0.0f; int n = 0;
+    for (int b = 0; b < numToneBands; ++b)
+    {
+        const float f = toneBandHz[(size_t) b];
+        if (f < 200.0f || f > 2000.0f) continue;
+        ref += out[(size_t) b]; ++n;
+    }
+    if (n > 0) { ref /= (float) n; for (auto& v : out) v -= ref; }
+    return out;
+}
+
+void reportToneMatch (const std::vector<float>& src, const std::vector<float>& out, double sr)
+{
+    auto sIn  = measureLtas (src, sr);
+    auto sOut = measureLtas (out, sr);
+
+    float tgtRef = 0.0f; int n = 0;
+    for (int b = 0; b < numToneBands; ++b)
+    {
+        const float f = toneBandHz[(size_t) b];
+        if (f < 200.0f || f > 2000.0f) continue;
+        tgtRef += kTargetLtasDb[(size_t) b]; ++n;
+    }
+    if (n > 0) tgtRef /= (float) n;
+
+    std::printf ("  tone match vs target (dB error by band, + = too loud):\n    ");
+    float worst = 0.0f, meanAbs = 0.0f, worstAt = 0.0f; int cnt = 0;
+    for (int b = 0; b < numToneBands; ++b)
+    {
+        const float f = toneBandHz[(size_t) b];
+        if (f < 50.0f || f > 16000.0f) continue;
+        const float err = sOut[(size_t) b] - (kTargetLtasDb[(size_t) b] - tgtRef);
+        std::printf ("%.0fHz:%+.1f  ", f, err);
+        if (std::abs (err) > std::abs (worst)) { worst = err; worstAt = f; }
+        meanAbs += std::abs (err); ++cnt;
+        if (cnt % 6 == 0) std::printf ("\n    ");
+    }
+    std::printf ("\n    worst %+.1f dB at %.0f Hz, mean |error| %.1f dB\n",
+                 worst, worstAt, cnt > 0 ? meanAbs / (float) cnt : 0.0f);
+
+    float inErr = 0.0f; int m = 0;
+    for (int b = 0; b < numToneBands; ++b)
+    {
+        const float f = toneBandHz[(size_t) b];
+        if (f < 50.0f || f > 16000.0f) continue;
+        inErr += std::abs (sIn[(size_t) b] - (kTargetLtasDb[(size_t) b] - tgtRef)); ++m;
+    }
+    std::printf ("    (source mean |error| was %.1f dB)\n", m > 0 ? inErr / (float) m : 0.0f);
+}
+
+/** Short-term loudness spread: what a listener hears as inconsistency. */
+void reportDynamics (const std::vector<float>& x, double sr, const char* label)
+{
+    const int win = (int) (0.4 * sr);
+    std::vector<float> st;
+    for (size_t i = 0; i + (size_t) win <= x.size(); i += (size_t) win / 4)
+    {
+        double a = 0.0;
+        for (int k = 0; k < win; ++k) a += (double) x[i + (size_t) k] * x[i + (size_t) k];
+        const float d = 10.0f * (float) std::log10 (std::max (a / win, 1e-20));
+        if (d > -60.0f) st.push_back (d);
+    }
+    if (st.size() < 8) { std::printf ("  %s dynamics: too little material\n", label); return; }
+    std::sort (st.begin(), st.end());
+    auto pc = [&] (float p) { return st[(size_t) (p * (st.size() - 1))]; };
+    std::printf ("  %s short-term loudness  p10 %.1f  p50 %.1f  p90 %.1f   spread(p90-p10) %.1f dB\n",
+                 label, pc (0.10f), pc (0.50f), pc (0.90f), pc (0.90f) - pc (0.10f));
+}
+
 void printLevelMap (const std::vector<float>& x, double sr, const char* label)
 {
     std::printf ("  %s level map (2 s cells, dBFS RMS):\n    ", label);
@@ -307,6 +422,7 @@ int main (int argc, char** argv)
         printLevelMap (dry, sr, "source");
     }
 
+    reportDynamics (dry, sr, "source");
     const float srcModulation = measureModulationDepth (dry, sr);
     std::printf ("  modulation depth %.3f  (higher = drier)\n", srcModulation);
 
@@ -421,10 +537,13 @@ int main (int argc, char** argv)
         const float outMod  = measureModulationDepth (outL, sr);
         std::printf ("  tail %.1f dB (src %.1f)   modulation depth %.3f (src %.3f)\n",
                      outTail, p.getAnalysisResult().tailDb, outMod, srcModulation);
+        reportToneMatch (dry, outL, sr);
+        reportDynamics (outL, sr, variant.name);
         auto s = measure (outL, sr);
         std::printf ("  declipped %d samples   plosive guard max %.1f dB (LF transient ratio %.1f)\n",
                      p.getDeclippedCount(), worstPlosive, p.getPlosivePeakBoost());
-        std::printf ("  compressor max %.1f dB   de-esser max %.1f dB\n", worstGr, worstDeEss);
+        std::printf ("  compressor max %.1f dB   de-esser max %.1f dB   dynamic EQ max %.1f dB on %d bins\n",
+                     worstGr, worstDeEss, p.getResonanceReductionDb(), p.getResonanceBinCount());
         std::printf ("[%s] latency %d  ->  peak %.1f dBFS  rms %.1f  crest %.1f  LUFS %.1f  clipped %d\n",
                      variant.name, latency, s.peakDb, s.rmsDb, s.crestDb, s.lufs, s.clipped);
         printLevelMap (outL, sr, variant.name);

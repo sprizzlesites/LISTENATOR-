@@ -73,6 +73,11 @@ public:
     void setHarmonicSpacing (float f0Hz) noexcept;
     void setResonanceDepth (float d) noexcept { resonanceDepth = juce::jmax (0.0f, d); }
 
+    /** Worst per-bin cut the resonance suppressor applied, in dB. */
+    float getResonanceReductionDb() const noexcept { return worstResonanceDb; }
+    /** Number of bins it acted on in the last frame. */
+    int   getResonanceBinCount()    const noexcept { return resonanceBins; }
+
     bool isActive() const noexcept
     { return denoise > 0.0f || deverb > 0.0f || resonanceDepth > 0.0f; }
 
@@ -108,16 +113,27 @@ private:
     int   samplesUntilFrame = hop;
     float denoise = 0.0f, deverb = 0.0f, resonanceDepth = 0.0f;
     float deverbDecayPerHop = 0.0f;
+    float worstResonanceDb = 0.0f;
+    int   resonanceBins = 0;
     int   minEnvSpanBins = 8;
     float olaNorm = 2.0f / 3.0f;
 };
 
 //==============================================================================
-/** Two-stage compressor: slow RMS leveller, then fast peak control.
+/** Two-stage compressor, each stage working at a different rate.
 
-    The detectors differ on purpose. Stage 1's threshold comes from the
-    measured integrated loudness, so it must see an RMS-like level or it fires
-    a full crest factor too early. Stage 2 catches transients, so it needs peak.
+    Splitting by rate is what lets it be consistent without sounding squashed:
+
+      take    2.5 s release  reconciles punch-ins recorded at different levels
+      peak    110 ms         catches transients only
+
+    Nothing here runs at syllable rate (2-8 Hz) on purpose. A compressor whose
+    release lands in that band flattens the envelope, and a flattened envelope
+    fills the valleys between syllables -- perceptually the same thing
+    reverberation does, which is the opposite of the job.
+
+    The detectors differ too: the take and phrase stages have thresholds derived
+    from loudness measurements, so they need RMS; the peak stage needs peak.
 */
 class DualCompressor
 {
@@ -291,6 +307,8 @@ public:
     float getGateGain() const noexcept         { return gateGain; }
     float getPlosiveReductionDb() const noexcept { return plosive.getReductionDb(); }
     float getPlosivePeakBoost()  const noexcept  { return plosive.getPeakBoost(); }
+    float getResonanceReductionDb() const noexcept { return spectral[0].getResonanceReductionDb(); }
+    int   getResonanceBinCount()    const noexcept { return spectral[0].getResonanceBinCount(); }
     int   getDeclippedCount() const noexcept     { return deClip.getRepairedCount(); }
 
 private:
@@ -306,7 +324,10 @@ private:
 
     static constexpr int maxSurgical = 8;
 
-    juce::dsp::IIR::Filter<float> hpf[2];
+    // Two cascaded Butterworth sections: 24 dB/oct. A single section leaves
+    // rumble an octave down only 12 dB attenuated while already pulling on the
+    // chest register just above the corner.
+    juce::dsp::IIR::Filter<float> hpf[2], hpf2[2];
     std::array<juce::dsp::IIR::Filter<float>, maxSurgical>    surgical[2];
     std::array<juce::dsp::IIR::Filter<float>, numToneBands>   toneBands[2];
     int numSurgical = 0, numTone = 0;

@@ -209,14 +209,22 @@ void SpectralEngine::processFrame()
         // trigger point has to clear that before anything is called resonant.
         constexpr float kResonanceThreshDb = 9.0f;
 
+        int binsThisFrame = 0;
         for (int b = 1; b < numBins; ++b)
         {
             if (env[(size_t) b] <= 1.0e-9f) continue;
             const float excessDb = gainToDb (mag[(size_t) b] / env[(size_t) b]);
             if (excessDb > kResonanceThreshDb)
-                gains[(size_t) b] *= dbToGain (juce::jmax (
-                    -(excessDb - kResonanceThreshDb) * resonanceDepth, -12.0f));
+            {
+                const float cut = juce::jmax (
+                    -(excessDb - kResonanceThreshDb) * resonanceDepth, -12.0f);
+                gains[(size_t) b] *= dbToGain (cut);
+                worstResonanceDb = juce::jmin (worstResonanceDb, cut);
+                ++binsThisFrame;
+            }
         }
+
+        resonanceBins = juce::jmax (resonanceBins, binsThisFrame);
     }
 
     // ---- noise floor, tracked in THIS FFT's own units ----------------------
@@ -349,6 +357,11 @@ void DualCompressor::setParams (const AnalysisResult& a, float amount)
     leveller.attackCoef  = timeCoef (a.compLevelAttackMs,  sr);
     leveller.releaseCoef = timeCoef (a.compLevelReleaseMs, sr);
 
+    // A phrase-rate stage was tried here and removed. It added 5 dB of gain
+    // reduction and tightened the short-term spread by nothing measurable
+    // (6.8 -> 7.0 dB): once the take stage has both the quiet and loud passages
+    // above its threshold, a second downward compressor scales them together
+    // rather than closing the gap between them.
     peak.threshDb    = a.compPeakThreshDb;
     peak.ratio       = 1.0f + (a.compPeakRatio - 1.0f) * amt;
     peak.kneeDb      = 4.0f;
@@ -762,6 +775,7 @@ void CleanupChain::prepare (double sampleRate, int maxBlockSize, int numChannels
     for (int ch = 0; ch < channels; ++ch)
     {
         hpf[ch].prepare (spec);
+        hpf2[ch].prepare (spec);
         spectral[ch].prepare (sampleRate);
         for (auto& f : surgical[ch])  f.prepare ({ sampleRate, (juce::uint32) maxBlock, 1 });
         for (auto& f : toneBands[ch]) f.prepare ({ sampleRate, (juce::uint32) maxBlock, 1 });
@@ -781,6 +795,7 @@ void CleanupChain::reset()
     for (int ch = 0; ch < channels; ++ch)
     {
         hpf[ch].reset();
+        hpf2[ch].reset();
         spectral[ch].reset();
         for (auto& f : surgical[ch])  f.reset();
         for (auto& f : toneBands[ch]) f.reset();
@@ -831,7 +846,9 @@ void CleanupChain::updateFilters()
     for (int ch = 0; ch < channels; ++ch)
     {
         *hpf[ch].coefficients =
-            *juce::dsp::IIR::Coefficients<float>::makeHighPass (sr, analysis.highPassHz, 0.707f);
+            *juce::dsp::IIR::Coefficients<float>::makeHighPass (sr, analysis.highPassHz, 0.541f);
+        *hpf2[ch].coefficients =
+            *juce::dsp::IIR::Coefficients<float>::makeHighPass (sr, analysis.highPassHz, 1.307f);
 
         // Fixed-size arrays with a live count: updateFilters can be reached
         // from the audio thread when a trim knob moves, so it must not allocate.
@@ -850,7 +867,10 @@ void CleanupChain::updateFilters()
         {
             // Use the solved gains, not the raw target: neighbouring 1/3-octave
             // filters overlap, so the two differ by several dB.
-            const float g = analysis.toneFilterGainDb[(size_t) b] * eqAmt;
+            // Pick the solve that matches whether the notches are actually in
+            // circuit; the two differ by several dB around each notch.
+            const float g = (bypass.surgicalEq ? analysis.toneFilterGainDbNoNotch
+                                               : analysis.toneFilterGainDb)[(size_t) b] * eqAmt;
             if (std::abs (g) < 0.2f) continue;
             const float f0 = toneBandHz[(size_t) b];
             if (f0 < 30.0f || f0 > sr * 0.45) continue;
@@ -929,7 +949,7 @@ void CleanupChain::process (juce::AudioBuffer<float>& buffer)
         {
             auto* d = buffer.getWritePointer (ch);
             for (int i = 0; i < numSamples; ++i)
-                d[i] = hpf[ch].processSample (d[i]);
+                d[i] = hpf2[ch].processSample (hpf[ch].processSample (d[i]));
         }
 
     // 2. de-noise + de-verb + resonance suppression, sharing one STFT

@@ -24,21 +24,6 @@ namespace
         return v[idx];
     }
 
-    /** Target long-term average spectrum for a professionally mixed lead vocal,
-        in dB relative to the 200 Hz-2 kHz average. Derived from the spectral
-        balance conventions the mixing literature agrees on: steep sub rolloff,
-        controlled low-mid body, a presence region that sits above the natural
-        rolloff, and a gently declining air shelf.
-
-        This is the single universal curve. `toneMatchDb` is the difference
-        between this and what actually came in. */
-    constexpr std::array<float, numToneBands> kTargetLtasDb {
-        -42.0f, -38.0f, -34.0f, -29.0f, -24.0f, -18.0f, -12.0f,  -7.0f,  // 20..100
-         -3.5f,  -1.5f,  -0.5f,   0.0f,   0.3f,   0.3f,   0.0f,  -0.8f,  // 125..630
-         -1.8f,  -2.8f,  -3.8f,  -4.8f,  -5.4f,  -5.8f,  -6.0f,  -6.6f,  // 800..4k
-         -8.5f, -10.5f, -13.0f, -16.0f, -19.5f, -24.0f, -32.0f           // 5k..20k
-    };
-
     /** RBJ biquad, used for the K-weighting pre-filter. */
     struct Biquad
     {
@@ -1011,6 +996,10 @@ void VocalAnalyzer::deriveSettings (AnalysisResult& r)
         }
     }
 
+    // The corner stays where the voice says it should. What changed is the
+    // slope: at 24 dB/oct the filter is 0.7 dB down at 100 Hz but 20 dB down at
+    // 50 Hz, where a single section left a -6.6 dB hole in the chest register
+    // AND +4.7 dB of surviving rumble.
     r.highPassHz = std::clamp (std::min (fromPitch, fromSpectrum), 45.0f, 110.0f);
 
     // ---- gate --------------------------------------------------------------
@@ -1065,8 +1054,23 @@ void VocalAnalyzer::deriveSettings (AnalysisResult& r)
     // directly comparable to the measured integrated loudness. Sitting it
     // slightly BELOW the programme level is what makes it level rather than
     // just catch occasional peaks.
-    r.compLevelThreshDb  = r.integratedLufs - 3.0f;
-    r.compLevelRatio     = std::clamp (1.0f + r.loudnessRangeDb / 8.0f, 1.5f, 4.0f);
+    // Under the quietest real delivery, not near the average. With the
+    // threshold at LUFS-3 the quiet punch-ins sat entirely below it and got no
+    // levelling at all, which is why the short-term spread stalled well above
+    // target however hard the loud takes were squeezed.
+    r.compLevelThreshDb = std::min (r.speechFloorDb + 2.0f, r.integratedLufs - 4.0f);
+
+    // Ratio chosen to land the loudness range near 5 dB, which is about where a
+    // rap vocal stops moving around in a mix.
+    {
+        // Aimed below the figure actually wanted. The stage is deliberately slow,
+        // so within any short-term window it has only partly acted; targeting
+        // 5 dB directly measured out at 6.7.
+        constexpr float targetRangeDb = 3.5f;
+        const float lra = std::max (r.loudnessRangeDb, 1.0f);
+        const float wanted = lra > targetRangeDb ? lra / targetRangeDb : 1.0f;
+        r.compLevelRatio = std::clamp (wanted, 1.5f, 4.0f);
+    }
 
     // Slow on purpose. This stage exists to reconcile takes punched in at
     // different levels, which is a change over SECONDS. Timings fast enough to
@@ -1166,9 +1170,23 @@ void VocalAnalyzer::deriveSettings (AnalysisResult& r)
     thread so the audio thread never sees the cost. */
 void VocalAnalyzer::solveToneFilterGains (AnalysisResult& r) const
 {
+    solveToneGainsInto (r, true,  r.toneFilterGainDb);
+    solveToneGainsInto (r, false, r.toneFilterGainDbNoNotch);
+}
+
+void VocalAnalyzer::solveToneGainsInto (const AnalysisResult& r, bool withNotches,
+                                        std::array<float, numToneBands>& result) const
+{
     // A 1/3-octave bandwidth corresponds to Q ~ 4.32.
     const float p = std::pow (2.0f, 1.0f / 3.0f);
     const float q = std::sqrt (p) / (p - 1.0f);
+
+    // What the rest of the chain will do to the spectrum AFTER this curve was
+    // measured. The target has to be adjusted by it, or the tone stage spends
+    // its effort fighting the high-pass and the notches instead of shaping tone.
+    std::array<float, numToneBands> chain {};
+    if (withNotches) accumulateChainResponse (r, chain);
+    else             chain.fill (0.0f);
 
     std::array<std::array<float, numToneBands>, numToneBands> m {};
 
@@ -1208,14 +1226,41 @@ void VocalAnalyzer::solveToneFilterGains (AnalysisResult& r) const
             for (int j = 0; j < numToneBands; ++j)
                 if (j != i) sum += m[(size_t) i][(size_t) j] * g[(size_t) j];
 
-            const float want = (r.toneMatchDb[(size_t) i] - sum) / diag;
+            const float target = r.toneMatchDb[(size_t) i] - chain[(size_t) i];
+            const float want = (target - sum) / diag;
             // damped update keeps the sweep stable on the wide low bands
             g[(size_t) i] = std::clamp (g[(size_t) i] + 0.7f * (want - g[(size_t) i]),
                                         -12.0f, 12.0f);
         }
     }
 
-    r.toneFilterGainDb = g;
+    result = g;
+}
+
+void VocalAnalyzer::accumulateChainResponse (const AnalysisResult& r,
+                                             std::array<float, numToneBands>& out) const
+{
+    out.fill (0.0f);
+
+    // Deliberately excludes the high-pass. Compensating for it would have the
+    // tone stage boost back exactly what the filter is there to remove -- which
+    // measured as +19.6 dB of surviving rumble at 50 Hz when tried. Only the
+    // notches belong here: their skirts reach into neighbouring bands as a side
+    // effect, and that part is worth cancelling.
+    for (int b = 0; b < numToneBands; ++b)
+    {
+        const float f = toneBandHz[(size_t) b];
+        if (f >= sr * 0.45) continue;
+
+        for (const auto& res : r.resonances)
+        {
+            auto c = juce::dsp::IIR::Coefficients<float>::makePeakFilter (
+                         sr, res.frequencyHz, res.q, std::pow (10.0f, res.gainDb / 20.0f));
+            const float rm = (float) c->getMagnitudeForFrequency (f, sr);
+            if (rm > 1.0e-6f)
+                out[(size_t) b] += 20.0f * std::log10 (rm);
+        }
+    }
 }
 
 } // namespace listenator
