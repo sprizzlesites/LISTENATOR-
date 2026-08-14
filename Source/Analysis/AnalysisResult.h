@@ -42,8 +42,11 @@ struct AnalysisResult
     // ---- noise / room -----------------------------------------------------
     float noiseFloorDb    = -90.0f; // minimum-statistics estimate
     float snrDb           = 90.0f;
+    float speechFloorDb   = -40.0f;   // level of the quietest real delivery
     float rt60Seconds     = 0.0f;   // 0 == anechoic
     float reverbRatio     = 0.0f;   // late energy / direct energy, 0..1
+    float tailDb          = -40.0f; // measured tail level relative to direct
+    int   tailSamples     = 0;      // usable gaps the measurement found
 
     // ---- pitch ------------------------------------------------------------
     float medianF0Hz      = 0.0f;

@@ -262,6 +262,19 @@ void VocalAnalyzer::computeLtasAndNoise (AnalysisResult& r)
     const float speechDb = percentile (frameRmsDb, 0.90f);
     r.snrDb = speechDb - r.noiseFloorDb;
 
+    // The quietest genuine delivery, as opposed to the quietest silence. Frames
+    // more than 6 dB above the floor are treated as speech; the low percentile
+    // of those is what the gate must stay underneath.
+    {
+        std::vector<float> speech;
+        speech.reserve (frameRmsDb.size());
+        for (float d : frameRmsDb)
+            if (d > r.noiseFloorDb + 6.0f) speech.push_back (d);
+
+        r.speechFloorDb = speech.empty() ? r.noiseFloorDb + 12.0f
+                                         : percentile (speech, 0.08f);
+    }
+
     // Second pass over the quiet frames only, to get the SHAPE of the noise.
     // Spectral subtraction needs the noise spectrum; handing it the full-signal
     // LTAS instead makes it subtract the vocal from itself.
@@ -629,86 +642,151 @@ void VocalAnalyzer::measureSibilantLevel (AnalysisResult& r)
     r.sibilantSpreadDb = spread;
 }
 
-/** Resonances = where the spectrum pokes above its own local envelope. */
+/** Resonances = frequencies that poke above the local spectral envelope AND
+    stay put across the whole take.
+
+    That second condition is what separates a room resonance from the singer's
+    own voice. A harmonic moves with the pitch, so across sub-windows of the
+    capture it wanders; a wall mode sits at the same frequency all the way
+    through. Without the consistency test the detector notches the fundamental
+    and its first few harmonics, which is the fastest way to make a voice sound
+    thin and hollow. */
 void VocalAnalyzer::computeResonances (AnalysisResult& r)
 {
     r.resonances.clear();
 
-    // resample the spectrum onto a log-frequency grid so "one octave" is a
-    // constant number of points
-    constexpr int kGrid = 256;
-    const float fLo = 80.0f, fHi = 16000.0f;
+    constexpr int kSub  = 8;      // sub-windows across the capture
+    constexpr int kGrid = 256;    // log-frequency points
+    const float fLo = 80.0f, fHi = 12000.0f;
 
-    std::vector<float> gridDb ((size_t) kGrid), gridHz ((size_t) kGrid);
+    std::vector<float> gridHz ((size_t) kGrid);
     for (int i = 0; i < kGrid; ++i)
-    {
-        const float f = fLo * std::pow (fHi / fLo, (float) i / (float) (kGrid - 1));
-        gridHz[(size_t) i] = f;
+        gridHz[(size_t) i] = fLo * std::pow (fHi / fLo, (float) i / (float) (kGrid - 1));
 
-        const int bin = std::clamp ((int) std::round (f * fftSize / sr),
-                                    1, fftSize / 2 - 1);
-        gridDb[(size_t) i] = toDb (avgPower[(size_t) bin]);
-    }
-
-    // envelope = ~1 octave moving average on the log grid
+    // The envelope must span several harmonics of this voice, or every harmonic
+    // reads as a peak. Below ~4*F0 there aren't enough harmonics to average, so
+    // widen further there.
+    const float f0 = r.medianF0Hz > 40.0f ? r.medianF0Hz : 140.0f;
     const int pointsPerOctave = (int) ((kGrid - 1) / std::log2 (fHi / fLo));
-    const int halfWin = std::max (2, pointsPerOctave / 2);
 
-    std::vector<float> env ((size_t) kGrid);
-    for (int i = 0; i < kGrid; ++i)
+    std::vector<std::vector<float>> excess ((size_t) kSub,
+                                            std::vector<float> ((size_t) kGrid, 0.0f));
+
+    const int subLen = captureLen / kSub;
+
+    for (int w = 0; w < kSub; ++w)
     {
-        const int a = std::max (0, i - halfWin);
-        const int b = std::min (kGrid - 1, i + halfWin);
-        float sum = 0.0f;
-        for (int j = a; j <= b; ++j) sum += gridDb[(size_t) j];
-        env[(size_t) i] = sum / (float) (b - a + 1);
+        std::vector<float> power ((size_t) fftSize / 2, 0.0f);
+        int frames = 0;
+
+        for (int start = w * subLen;
+             start + fftSize <= (w + 1) * subLen && start + fftSize <= captureLen;
+             start += hopSize)
+        {
+            std::fill (fftScratch.begin(), fftScratch.end(), 0.0f);
+            std::memcpy (fftScratch.data(), capture.data() + start,
+                         sizeof (float) * (size_t) fftSize);
+            window.multiplyWithWindowingTable (fftScratch.data(), (size_t) fftSize);
+            fft.performFrequencyOnlyForwardTransform (fftScratch.data());
+
+            for (int i = 0; i < fftSize / 2; ++i)
+                power[(size_t) i] += fftScratch[(size_t) i] * fftScratch[(size_t) i];
+            ++frames;
+        }
+        if (frames == 0) continue;
+        for (auto& v : power) v /= (float) frames;
+
+        std::vector<float> gridDb ((size_t) kGrid);
+        for (int i = 0; i < kGrid; ++i)
+        {
+            const int bin = std::clamp ((int) std::round (gridHz[(size_t) i] * fftSize / sr),
+                                        1, fftSize / 2 - 1);
+            gridDb[(size_t) i] = toDb (power[(size_t) bin]);
+        }
+
+        for (int i = 0; i < kGrid; ++i)
+        {
+            // wider window where harmonics are sparse relative to frequency
+            const float harmonicsHere = gridHz[(size_t) i] / f0;
+            const float octaves = harmonicsHere < 6.0f ? 2.0f : 1.2f;
+            const int half = std::max (3, (int) (octaves * pointsPerOctave * 0.5f));
+
+            const int lo = std::max (0, i - half), hi = std::min (kGrid - 1, i + half);
+            float sum = 0.0f;
+            for (int j = lo; j <= hi; ++j) sum += gridDb[(size_t) j];
+            excess[(size_t) w][(size_t) i] = gridDb[(size_t) i] - sum / (float) (hi - lo + 1);
+        }
     }
 
-    // peaks poking >3 dB above the envelope become notches
-    constexpr float kMinProminenceDb = 3.0f;
+    // A candidate must clear the threshold in most sub-windows to count.
+    constexpr float kProminenceDb = 3.5f;
+    constexpr int   kMinAgreement = 5;   // of 8
+
+    struct Cand { float hz, db; int agree; };
+    std::vector<Cand> cands;
+
     for (int i = 1; i < kGrid - 1; ++i)
     {
-        const float excess = gridDb[(size_t) i] - env[(size_t) i];
-        if (excess < kMinProminenceDb) continue;
-        if (gridDb[(size_t) i] < gridDb[(size_t) (i - 1)]) continue;
-        if (gridDb[(size_t) i] < gridDb[(size_t) (i + 1)]) continue;
+        int agree = 0;
+        float meanExcess = 0.0f;
 
-        // width at half prominence -> Q
-        int lo = i, hi = i;
-        const float halfEx = excess * 0.5f;
-        while (lo > 0        && gridDb[(size_t) lo] - env[(size_t) lo] > halfEx) --lo;
-        while (hi < kGrid - 1 && gridDb[(size_t) hi] - env[(size_t) hi] > halfEx) ++hi;
+        for (int w = 0; w < kSub; ++w)
+        {
+            const float e = excess[(size_t) w][(size_t) i];
+            if (e > kProminenceDb
+                && e >= excess[(size_t) w][(size_t) (i - 1)]
+                && e >= excess[(size_t) w][(size_t) (i + 1)])
+                ++agree;
+            meanExcess += e;
+        }
+        meanExcess /= (float) kSub;
 
-        const float bwOct = std::log2 (std::max (gridHz[(size_t) hi], 1.0f)
-                                     / std::max (gridHz[(size_t) lo], 1.0f));
-        if (bwOct <= 0.0f) continue;
-
-        Resonance res;
-        res.frequencyHz = gridHz[(size_t) i];
-        // cut most of the excess but never fully - full removal sounds gutted
-        res.gainDb = -std::min (excess * 0.7f, 9.0f);
-        res.q      = std::clamp (1.0f / bwOct, 1.0f, 12.0f);
-        r.resonances.push_back (res);
+        if (agree >= kMinAgreement && meanExcess > kProminenceDb * 0.5f)
+            cands.push_back ({ gridHz[(size_t) i], meanExcess, agree });
     }
 
-    // keep the worst offenders only; a wall of notches is how auto-EQ sounds bad
-    std::sort (r.resonances.begin(), r.resonances.end(),
-               [] (const Resonance& a, const Resonance& b) { return a.gainDb < b.gainDb; });
-    if (r.resonances.size() > 8)
-        r.resonances.resize (8);
+    // Worst first, then reject anything sitting on top of an accepted notch --
+    // the log grid finds the same peak several points running otherwise.
+    std::sort (cands.begin(), cands.end(),
+               [] (const Cand& a, const Cand& b) { return a.db > b.db; });
+
+    for (const auto& c : cands)
+    {
+        if ((int) r.resonances.size() >= 6) break;
+
+        bool tooClose = false;
+        for (const auto& acc : r.resonances)
+            if (std::abs (std::log2 (c.hz / acc.frequencyHz)) < 0.33f)   // 1/3 octave
+            { tooClose = true; break; }
+        if (tooClose) continue;
+
+        Resonance res;
+        res.frequencyHz = c.hz;
+        // Take out most of the excess, never all of it: full removal sounds gutted.
+        res.gainDb = -std::min ((c.db - kProminenceDb * 0.5f) * 0.8f, 8.0f);
+        res.q      = std::clamp (4.0f + (c.db - kProminenceDb), 3.0f, 9.0f);
+        if (res.gainDb < -0.8f)
+            r.resonances.push_back (res);
+    }
 }
 
-/** RT60 from note-offset decay slopes.
+/** RT60 from decay slopes in the gaps of continuous delivery.
 
-    A vocal take isn't an impulse response, but the decay after phrase endings
-    carries the room. We fit dB-vs-time over the -5..-25 dB portion of each
-    decay and extrapolate to 60 dB. */
+    The textbook method wants a loud impulse followed by 30 dB of clean
+    monotonic decay. A rapper never provides that: delivery is continuous, gaps
+    are short, and the tail rarely gets 30 dB down before the next syllable. The
+    original constraints found almost nothing on real material and reported an
+    anechoic room for a take recorded in an obviously live booth.
+
+    So: shorter analysis frames, a much shorter fit range, and a percentile that
+    favours the SLOW decays -- the fast ones are the singer stopping, the slow
+    ones are the room. */
 void VocalAnalyzer::computeReverb (AnalysisResult& r)
 {
-    const int frameLen = (int) (0.010 * sr);   // 10 ms
-    if (frameLen <= 0) return;
-
+    const int frameLen = std::max (16, (int) (0.005 * sr));   // 5 ms
     std::vector<float> envDb;
+    envDb.reserve ((size_t) (captureLen / frameLen + 1));
+
     for (int start = 0; start + frameLen <= captureLen; start += frameLen)
     {
         double acc = 0.0;
@@ -720,60 +798,115 @@ void VocalAnalyzer::computeReverb (AnalysisResult& r)
         envDb.push_back (toDb ((float) (acc / frameLen)));
     }
 
-    if (envDb.size() < 20) return;
+    if (envDb.size() < 40) return;
 
-    std::vector<float> slopes;
-    const int minRun = 15;    // 150 ms
+    const float frameSec = (float) frameLen / (float) sr;
+    std::vector<float> rt60s;
 
-    for (size_t i = 1; i + (size_t) minRun < envDb.size(); ++i)
+    // A usable decay only needs to clear the floor, not dominate it.
+    const float minPeak = r.noiseFloorDb + 12.0f;
+
+    for (size_t i = 1; i + 12 < envDb.size(); ++i)
     {
-        // a local maximum starts a candidate decay
-        if (envDb[i] < envDb[i - 1]) continue;
+        if (envDb[i] < envDb[i - 1]) continue;      // want a local maximum
+        if (envDb[i] < minPeak) continue;
 
         const float peak = envDb[i];
-        if (peak < r.noiseFloorDb + 30.0f) continue;   // need headroom to measure
-
         size_t j = i, startFit = 0, endFit = 0;
-        while (j + 1 < envDb.size() && envDb[j + 1] < envDb[j])
+
+        // allow small upticks so a little noise doesn't abort the run
+        int rises = 0;
+        while (j + 1 < envDb.size() && rises < 2)
         {
+            if (envDb[j + 1] > envDb[j] + 0.5f) ++rises;
+
             const float drop = peak - envDb[j];
-            if (startFit == 0 && drop >= 5.0f)  startFit = j;
-            if (drop >= 25.0f)                  { endFit = j; break; }
+            if (startFit == 0 && drop >= 3.0f)  startFit = j;
+            if (drop >= 15.0f)                  { endFit = j; break; }
+            if (envDb[j] < r.noiseFloorDb + 3.0f) break;   // into the floor
             ++j;
         }
 
-        if (startFit == 0 || endFit == 0 || endFit <= startFit + 3) continue;
+        if (startFit == 0 || endFit == 0 || endFit < startFit + 4) continue;
 
         double sx = 0, sy = 0, sxx = 0, sxy = 0;
         const int n = (int) (endFit - startFit + 1);
         for (size_t k = startFit; k <= endFit; ++k)
         {
-            const double x = (double) k * 0.010;
-            const double y = envDb[k];
+            const double x = (double) k * frameSec, y = envDb[k];
             sx += x; sy += y; sxx += x * x; sxy += x * y;
         }
         const double d = n * sxx - sx * sx;
         if (std::abs (d) < 1.0e-9) continue;
 
-        const double slope = (n * sxy - sx * sy) / d;   // dB per second
-        if (slope < -1.0)
-            slopes.push_back ((float) slope);
+        const double slope = (n * sxy - sx * sy) / d;   // dB/s, negative
+        if (slope > -2.0) continue;
+
+        const float rt = (float) (-60.0 / slope);
+        if (rt > 0.05f && rt < 3.0f)
+            rt60s.push_back (rt);
 
         i = endFit;
     }
 
-    if (slopes.empty())
+    r.rt60Seconds = rt60s.empty() ? 0.0f
+                                  : std::clamp (percentile (rt60s, 0.85f), 0.0f, 2.0f);
+
+    // ---- how much tail is actually audible ---------------------------------
+    // RT60 describes the SHAPE of a decay; it says nothing about how much
+    // energy is still ringing when the next word lands. On continuous delivery
+    // that second quantity is what makes a booth sound washy, and it is what
+    // de-verb should be driven by. Measure it directly: at each speech offset,
+    // compare the energy 80-250 ms later against the energy just before.
+    const int pre    = std::max (1, (int) (0.100 / frameSec));
+    const int gapLo  = std::max (1, (int) (0.080 / frameSec));
+    const int gapHi  = std::max (2, (int) (0.250 / frameSec));
+
+    std::vector<float> tailRatios;
+
+    for (size_t i = (size_t) pre; i + (size_t) gapHi < envDb.size(); ++i)
     {
-        r.rt60Seconds = 0.0f;
-        r.reverbRatio = 0.0f;
-        return;
+        // an offset: was loud, drops away sharply
+        const float before = envDb[i];
+        if (before < r.noiseFloorDb + 18.0f) continue;
+        if (envDb[i + (size_t) gapLo] > before - 6.0f) continue;
+
+        float preAcc = 0.0f;
+        for (int k = 0; k < pre; ++k) preAcc += envDb[i - (size_t) k];
+        preAcc /= (float) pre;
+
+        // The window must be a REAL gap. On continuous delivery the next
+        // syllable usually lands inside 250 ms, and averaging it in reports a
+        // wildly reverberant room for a dry one. Require the whole window to
+        // stay down before believing any of it.
+        float tailAcc = 0.0f, tailMax = -200.0f; int n = 0;
+        for (int k = gapLo; k <= gapHi; ++k)
+        {
+            const float v = envDb[i + (size_t) k];
+            tailAcc += v; tailMax = std::max (tailMax, v); ++n;
+        }
+        tailAcc /= (float) std::max (1, n);
+
+        if (tailMax > before - 6.0f) continue;          // next word started
+        if (tailAcc < r.noiseFloorDb + 3.0f) continue;  // ran into the floor
+
+        tailRatios.push_back (tailAcc - preAcc);
     }
 
-    const float medianSlope = percentile (slopes, 0.50f);
-    r.rt60Seconds = std::clamp (-60.0f / medianSlope, 0.0f, 3.0f);
-
-    // crude direct-to-late split: anything decaying slower than 0.25 s reads as room
-    r.reverbRatio = std::clamp ((r.rt60Seconds - 0.15f) / 0.85f, 0.0f, 1.0f);
+    if (! tailRatios.empty())
+    {
+        // -35 dB and below is a dead room; -15 dB is a very live one.
+        const float tailDb = percentile (tailRatios, 0.5f);
+        r.tailDb = tailDb;
+        r.tailSamples = (int) tailRatios.size();
+        // -40 dB is a dead room, -12 dB is a very live one. The earlier 20 dB
+        // span pinned at 1.0 on anything real and lost all resolution.
+        r.reverbRatio = std::clamp ((tailDb + 40.0f) / 28.0f, 0.0f, 1.0f);
+    }
+    else
+    {
+        r.reverbRatio = std::clamp ((r.rt60Seconds - 0.12f) / 0.6f, 0.0f, 1.0f);
+    }
 }
 
 //==============================================================================
@@ -782,24 +915,72 @@ void VocalAnalyzer::computeReverb (AnalysisResult& r)
     Every number below traces back to something measured, not a preset. */
 void VocalAnalyzer::deriveSettings (AnalysisResult& r)
 {
-    // ---- high-pass: below the singer's lowest sung note, not a fixed 80 Hz --
-    if (r.f0P05Hz > 0.0f)
-        r.highPassHz = std::clamp (r.f0P05Hz * 0.75f, 40.0f, 180.0f);
-    else
-        r.highPassHz = 80.0f;
+    // ---- high-pass ---------------------------------------------------------
+    // Two independent estimates, because on rap the pitch track is only voiced
+    // maybe a fifth of the time and octave errors push f0P05 far too high.
+    //   1. below the lowest sung note
+    //   2. where the measured spectrum has genuinely fallen away
+    // Take the lower. Cutting into the chest register to chase a bad pitch
+    // reading is how an automatic HPF hollows out a male voice.
+    float fromPitch = 110.0f;
+    if (r.f0P05Hz > 0.0f && r.voicedFraction > 0.10f)
+        fromPitch = std::clamp (r.f0P05Hz * 0.62f, 45.0f, 110.0f);
 
-    // ---- gate: sit above the measured noise floor, below the quietest phrase
-    r.gateThresholdDb = std::clamp (r.noiseFloorDb + 8.0f, -80.0f, -20.0f);
-    // shallow range when SNR is good; deep when there's real noise to kill
-    r.gateRangeDb   = -std::clamp (r.snrDb * 0.35f, 6.0f, 30.0f);
-    r.gateAttackMs  = 1.0f;
+    float fromSpectrum = 80.0f;
+    {
+        // reference level across the body of the voice
+        float bodyDb = kMinDb; int cnt = 0; float acc = 0.0f;
+        for (int b = 0; b < numToneBands; ++b)
+        {
+            const float f = toneBandHz[(size_t) b];
+            if (f < 150.0f || f > 500.0f) continue;
+            acc += r.measuredLtasDb[(size_t) b]; ++cnt;
+        }
+        if (cnt > 0) bodyDb = acc / (float) cnt;
+
+        // walk down until the spectrum sits well below the body
+        for (int b = numToneBands - 1; b >= 0; --b)
+        {
+            const float f = toneBandHz[(size_t) b];
+            if (f > 200.0f) continue;
+            if (r.measuredLtasDb[(size_t) b] < bodyDb - 14.0f)
+            { fromSpectrum = std::clamp (f * 1.15f, 40.0f, 110.0f); break; }
+        }
+    }
+
+    r.highPassHz = std::clamp (std::min (fromPitch, fromSpectrum), 45.0f, 110.0f);
+
+    // ---- gate --------------------------------------------------------------
+    // The threshold has to clear the noise floor AND stay under the quietest
+    // real delivery. Punch-ins recorded at wildly different levels mean the
+    // quiet takes can sit only a few dB above the floor, and a gate placed by
+    // the floor alone swallows them whole.
+    {
+        const float aboveFloor = r.noiseFloorDb + 8.0f;
+        const float underQuiet = r.speechFloorDb - 8.0f;
+        r.gateThresholdDb = std::clamp (std::min (aboveFloor, underQuiet), -80.0f, -24.0f);
+    }
+
+    // Depth follows how much noise there actually is. A clean-ish take gets a
+    // token amount of downward expansion, not a hard gate.
+    r.gateRangeDb   = -std::clamp ((40.0f - r.snrDb) * 0.6f, 3.0f, 24.0f);
+    r.gateAttackMs  = 1.5f;
     // release tracks the room so gating doesn't chop the natural tail
-    r.gateReleaseMs = std::clamp (r.rt60Seconds * 1000.0f * 0.6f, 60.0f, 500.0f);
+    r.gateReleaseMs = std::clamp (r.rt60Seconds * 1000.0f * 0.8f, 90.0f, 600.0f);
 
     // ---- de-noise / de-verb: aggression scales with how bad the input is ----
     // Clean source -> near zero. Bad bedroom recording -> pushes hard.
-    r.denoiseAmount = std::clamp ((45.0f - r.snrDb) / 30.0f, 0.0f, 1.0f);
-    r.deverbAmount  = std::clamp ((r.rt60Seconds - 0.18f) / 0.6f, 0.0f, 1.0f);
+    // Measured this way, a decent booth lands around 22-28 dB SNR; the old
+    // curve read that as "badly broken" and pushed spectral subtraction to 0.76,
+    // which costs far more in artifacts than it removes in hiss.
+    r.denoiseAmount = std::clamp ((28.0f - r.snrDb) / 22.0f, 0.0f, 0.7f);
+
+    // Driven by how much tail is audible rather than by RT60. A tight-sounding
+    // RT60 with a lot of energy still ringing between words is exactly the
+    // booth-echo case, and keying off RT60 alone misses it completely.
+    const float fromTail  = r.reverbRatio;
+    const float fromRt60  = std::clamp ((r.rt60Seconds - 0.10f) / 0.35f, 0.0f, 1.0f);
+    r.deverbAmount = std::clamp (std::max (fromTail, fromRt60) * 0.75f, 0.0f, 0.7f);
 
     // ---- compression -------------------------------------------------------
     // Attack/release from crest factor, following the parameter-automation
@@ -868,7 +1049,12 @@ void VocalAnalyzer::deriveSettings (AnalysisResult& r)
         if (r.measuredLtasDb[(size_t) b] < r.noiseFloorDb + 6.0f)
         { raw[(size_t) b] = 0.0f; continue; }
 
-        raw[(size_t) b] = std::clamp (tgt - meas, -8.0f, 8.0f);
+        // Asymmetric on purpose: a cut can only ever remove something that is
+        // measurably too loud, while a boost lifts whatever else lives in that
+        // band -- noise, room, sibilance. Boosts are also tightened further up
+        // top, where there is least signal and most junk.
+        const float maxBoost = toneBandHz[(size_t) b] > 8000.0f ? 2.5f : 4.0f;
+        raw[(size_t) b] = std::clamp (tgt - meas, -8.0f, maxBoost);
     }
 
     // 3-band smoothing: broad tonal moves, never a comb

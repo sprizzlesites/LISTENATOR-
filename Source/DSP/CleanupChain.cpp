@@ -43,7 +43,12 @@ void SpectralEngine::prepare (double sampleRate)
     frame.assign      ((size_t) size * 2, 0.0f);
 
     noiseMin.assign    (numBins, 1.0e9f);
-    revEnvelope.assign (numBins, 0.0f);
+
+    // ~64 ms of history: long enough that the delayed frame is genuinely past
+    // excitation rather than the same syllable.
+    historyDelay = juce::jlimit (4, 40, (int) (0.064 * sampleRate / hop));
+    magHistory.assign ((size_t) historyDelay + 1, std::vector<float> (numBins, 0.0f));
+    historyPos = 0;
     prevGain.assign    (numBins, 1.0f);
     mag.assign         (numBins, 0.0f);
     env.assign         (numBins, 0.0f);
@@ -57,7 +62,6 @@ void SpectralEngine::reset()
 {
     std::fill (inputRing.begin(),  inputRing.end(),  0.0f);
     std::fill (outputRing.begin(), outputRing.end(), 0.0f);
-    std::fill (revEnvelope.begin(), revEnvelope.end(), 0.0f);
     std::fill (noiseMin.begin(), noiseMin.end(), 1.0e9f);
     std::fill (prevGain.begin(), prevGain.end(), 1.0f);
     pos = 0;
@@ -116,10 +120,16 @@ void SpectralEngine::setDeverbDecay (float rt60) noexcept
 {
     if (rt60 <= 0.01f) { deverbDecayPerHop = 0.0f; return; }
 
-    // Amplitude decay of the late field across one hop, from RT60.
-    const float hopSeconds = (float) hop / (float) sr;
-    deverbDecayPerHop = juce::jlimit (0.0f, 0.999f,
-                                      std::pow (10.0f, -3.0f * hopSeconds / rt60));
+    // How far the late field has decayed across the history delay.
+    const float delaySeconds = (float) (historyDelay * hop) / (float) sr;
+    deverbDecayPerHop = juce::jlimit (0.05f, 0.95f,
+                                      std::pow (10.0f, -3.0f * delaySeconds / rt60));
+}
+
+void SpectralEngine::setTailRatio (float ratio) noexcept
+{
+    // Direct-to-reverberant scaling for the delayed estimate.
+    deverbGamma = juce::jlimit (0.0f, 0.9f, ratio);
 }
 
 void SpectralEngine::process (float* block, int numSamples)
@@ -229,27 +239,34 @@ void SpectralEngine::processFrame()
         }
     }
 
-    // ---- de-verb: decaying peak-follower estimates the late field ----------
-    if (deverb > 0.0f && deverbDecayPerHop > 0.0f)
+    // ---- de-verb: late field estimated from a DELAYED spectrum -------------
+    // What is still ringing now came from excitation ~64 ms ago, decayed by the
+    // room. Estimating it from the CURRENT frame's own envelope is what made an
+    // earlier version subtract the direct sound: on continuous delivery the
+    // envelope and the signal are the same thing.
+    if (deverb > 0.0f && deverbGamma > 0.0f)
     {
+        const auto& past = magHistory[(size_t) ((historyPos + 1) % (int) magHistory.size())];
+
         for (int b = 0; b < numBins; ++b)
         {
             const float m = mag[(size_t) b];
+            if (m <= 1.0e-9f) continue;
 
-            // The estimate is a decaying peak, never a running sum: a sum has
-            // steady state alpha*m/(1-alpha), several times the signal itself,
-            // which pins every bin to the floor.
-            const float late = revEnvelope[(size_t) b];
+            const float late = past[(size_t) b] * deverbGamma * deverbDecayPerHop;
 
-            if (m > 1.0e-9f && late > 0.0f)
-            {
-                const float subtract = juce::jmin (late, m) * deverb;
-                gains[(size_t) b] *= juce::jmax (m - subtract, m * 0.12f) / m;
-            }
-
-            revEnvelope[(size_t) b] = juce::jmax (revEnvelope[(size_t) b] * deverbDecayPerHop,
-                                                  m * deverbDecayPerHop);
+            // Never take out more than half the bin: over-subtraction on a
+            // dense mid-word spectrum is what produces the watery artifact.
+            const float subtract = juce::jmin (late * deverb, m * 0.5f);
+            gains[(size_t) b] *= juce::jmax (m - subtract, m * 0.3f) / m;
         }
+    }
+
+    // push this frame into the history ring
+    {
+        historyPos = (historyPos + 1) % (int) magHistory.size();
+        auto& slot = magHistory[(size_t) historyPos];
+        for (int b = 0; b < numBins; ++b) slot[(size_t) b] = mag[(size_t) b];
     }
 
     // ---- smooth gains over time so bins don't chirp frame to frame ---------
@@ -660,6 +677,7 @@ void CleanupChain::updateFilters()
         spectral[ch].setDenoiseAmount (bypass.deNoise ? 0.0f : analysis.denoiseAmount * clAmt);
         spectral[ch].setDeverbAmount  (bypass.deVerb  ? 0.0f : analysis.deverbAmount  * clAmt);
         spectral[ch].setDeverbDecay   (analysis.rt60Seconds);
+        spectral[ch].setTailRatio     (analysis.reverbRatio);
         spectral[ch].setHarmonicSpacing (analysis.medianF0Hz);
         spectral[ch].setResonanceDepth (bypass.resonance ? 0.0f : 0.55f * eqAmt);
     }

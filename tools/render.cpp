@@ -125,8 +125,8 @@ void dumpAnalysis (const AnalysisResult& a)
     std::printf ("  level     peak %.1f dB   rms %.1f dB   LUFS %.1f   crest %.1f dB   LRA %.1f\n",
                  a.peakDb, a.rmsDb, a.integratedLufs, a.crestFactorDb, a.loudnessRangeDb);
     std::printf ("  noise     floor %.1f dB   SNR %.1f dB\n", a.noiseFloorDb, a.snrDb);
-    std::printf ("  room      RT60 %.2f s   reverbRatio %.2f   -> deverb %.2f\n",
-                 a.rt60Seconds, a.reverbRatio, a.deverbAmount);
+    std::printf ("  room      RT60 %.2f s   tail %.1f dB from %d gaps   ratio %.2f   -> deverb %.2f\n",
+                 a.rt60Seconds, a.tailDb, a.tailSamples, a.reverbRatio, a.deverbAmount);
     std::printf ("  denoise   amount %.2f\n", a.denoiseAmount);
     std::printf ("  pitch     medianF0 %.1f Hz   p05 %.1f   p95 %.1f   voiced %.0f%%   drift %.1f cents\n",
                  a.medianF0Hz, a.f0P05Hz, a.f0P95Hz, a.voicedFraction * 100.0f,

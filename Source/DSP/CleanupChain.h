@@ -62,6 +62,8 @@ public:
     void setDenoiseAmount (float a) noexcept  { denoise = juce::jlimit (0.0f, 1.0f, a); }
     void setDeverbAmount  (float a) noexcept  { deverb  = juce::jlimit (0.0f, 1.0f, a); }
     void setDeverbDecay   (float rt60) noexcept;
+    /** 0..1 measure of how much tail is audible between words. */
+    void setTailRatio     (float ratio) noexcept;
     /** Widens the resonance envelope so a harmonic series isn't flattened. */
     void setHarmonicSpacing (float f0Hz) noexcept;
     void setResonanceDepth (float d) noexcept { resonanceDepth = juce::jmax (0.0f, d); }
@@ -86,7 +88,15 @@ private:
 
     // All scratch is preallocated: nothing here allocates on the audio thread.
     std::vector<float> inputRing, outputRing, frame;
-    std::vector<float> noiseMin, revEnvelope, prevGain, mag, env, gains;
+    std::vector<float> noiseMin, prevGain, mag, env, gains;
+
+    // Ring of past magnitude frames. Late reverberation is estimated from a
+    // DELAYED spectrum rather than a running envelope of the current one: on
+    // continuous delivery an envelope tracks the direct sound almost exactly,
+    // so subtracting it removes the voice instead of the room.
+    std::vector<std::vector<float>> magHistory;
+    int   historyPos = 0, historyDelay = 12;
+    float deverbGamma = 0.0f;
 
     int   pos = 0, ringLen = 0, mask = 0;
     int   samplesUntilFrame = hop;

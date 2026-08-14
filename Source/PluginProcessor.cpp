@@ -122,7 +122,7 @@ void ListenatorProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
     outputLimiter.prepare (sampleRate, samplesPerBlock, outCh);
     outputLimiter.setThresholdDb (-0.5f);
 
-    setLatencySamples (cleanup.getLatencySamples() + effects.getLatencySamples());
+    updateLatency();
 }
 
 void ListenatorProcessor::releaseResources()
@@ -144,6 +144,16 @@ void ListenatorProcessor::triggerListen()
 
     analysisApplied = false;
     analyzer.startListening (bpm, valid);
+}
+
+void ListenatorProcessor::updateLatency()
+{
+    if (! analysisApplied) { setLatencySamples (0); return; }
+
+    int total = 0;
+    if (! lastSkipCleanup) total += cleanup.getLatencySamples();
+    if (! lastSkipEffects) total += effects.getLatencySamples();
+    setLatencySamples (total);
 }
 
 void ListenatorProcessor::pullParameters()
@@ -242,8 +252,7 @@ void ListenatorProcessor::processBlock (juce::AudioBuffer<float>& buffer,
         cleanup.applyAnalysis (lastResult);
         effects.applyAnalysis (lastResult);
         analysisApplied = lastResult.valid;
-
-        setLatencySamples (cleanup.getLatencySamples() + effects.getLatencySamples());
+        updateLatency();
     }
 
     pullParameters();
@@ -264,6 +273,15 @@ void ListenatorProcessor::processBlock (juce::AudioBuffer<float>& buffer,
 
     const bool skipCleanup = apvts.getRawParameterValue (pid::cleanupBypass)->load() > 0.5f;
     const bool skipEffects = apvts.getRawParameterValue (pid::effectsBypass)->load() > 0.5f;
+
+    // A bypassed half delays nothing, so it must not be counted -- otherwise the
+    // host compensates for latency the signal never actually incurred.
+    if (skipCleanup != lastSkipCleanup || skipEffects != lastSkipEffects)
+    {
+        lastSkipCleanup = skipCleanup;
+        lastSkipEffects = skipEffects;
+        updateLatency();
+    }
 
     if (! skipCleanup) cleanup.process (buffer);
     if (! skipEffects) effects.process (buffer);

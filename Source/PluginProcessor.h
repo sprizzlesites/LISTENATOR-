@@ -109,6 +109,7 @@ private:
     static juce::AudioProcessorValueTreeState::ParameterLayout createLayout();
 
     void pullParameters();
+    void updateLatency();
 
     juce::AudioProcessorValueTreeState apvts;
 
@@ -119,6 +120,7 @@ private:
     AnalysisResult lastResult;
     int  seenGeneration = 0;
     bool analysisApplied = false;
+    bool lastSkipCleanup = false, lastSkipEffects = false;
 
     juce::AudioBuffer<float> monoScratch;
 
