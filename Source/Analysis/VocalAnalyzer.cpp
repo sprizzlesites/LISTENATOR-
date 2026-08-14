@@ -750,6 +750,10 @@ void VocalAnalyzer::computeResonances (AnalysisResult& r)
     std::sort (cands.begin(), cands.end(),
                [] (const Cand& a, const Cand& b) { return a.db > b.db; });
 
+    r.resonanceCandidates.clear();
+    for (size_t i = 0; i < cands.size() && i < 10; ++i)
+        r.resonanceCandidates.push_back ({ cands[i].hz, -cands[i].db, (float) cands[i].agree });
+
     for (const auto& c : cands)
     {
         if ((int) r.resonances.size() >= 6) break;
@@ -862,7 +866,16 @@ void VocalAnalyzer::computeReverb (AnalysisResult& r)
     const int gapLo  = std::max (1, (int) (0.080 / frameSec));
     const int gapHi  = std::max (2, (int) (0.250 / frameSec));
 
-    std::vector<float> tailRatios;
+    // Two windows across the same gap. Their difference is the decay rate, and
+    // that is a far more trustworthy RT60 than a slope fit over a run that the
+    // next syllable keeps cutting short.
+    const int earlyLo = std::max (1, (int) (0.060 / frameSec));
+    const int earlyHi = std::max (2, (int) (0.120 / frameSec));
+    const int lateLo  = std::max (3, (int) (0.150 / frameSec));
+    const int lateHi  = std::max (4, (int) (0.280 / frameSec));
+    const float windowGapSec = 0.215f - 0.090f;
+
+    std::vector<float> tailRatios, decayRates;
 
     for (size_t i = (size_t) pre; i + (size_t) gapHi < envDb.size(); ++i)
     {
@@ -890,7 +903,30 @@ void VocalAnalyzer::computeReverb (AnalysisResult& r)
         if (tailMax > before - 6.0f) continue;          // next word started
         if (tailAcc < r.noiseFloorDb + 3.0f) continue;  // ran into the floor
 
+        // decay rate across the gap
+        if (i + (size_t) lateHi < envDb.size())
+        {
+            float e = 0.0f, l = 0.0f; int ne = 0, nl = 0;
+            for (int k = earlyLo; k <= earlyHi; ++k) { e += envDb[i + (size_t) k]; ++ne; }
+            for (int k = lateLo;  k <= lateHi;  ++k) { l += envDb[i + (size_t) k]; ++nl; }
+            e /= (float) std::max (1, ne);
+            l /= (float) std::max (1, nl);
+
+            if (l > r.noiseFloorDb + 3.0f && e > l)
+                decayRates.push_back ((l - e) / windowGapSec);   // dB/s, negative
+        }
+
         tailRatios.push_back (tailAcc - preAcc);
+    }
+
+    // Prefer the two-window decay rate for RT60. The slope fit reads short on
+    // continuous delivery because it only ever sees the start of a decay before
+    // the next syllable lands.
+    if (! decayRates.empty())
+    {
+        const float slope = percentile (decayRates, 0.5f);
+        if (slope < -1.0f)
+            r.rt60Seconds = std::clamp (-60.0f / slope, 0.05f, 2.0f);
     }
 
     if (! tailRatios.empty())
@@ -963,10 +999,18 @@ void VocalAnalyzer::deriveSettings (AnalysisResult& r)
 
     // Depth follows how much noise there actually is. A clean-ish take gets a
     // token amount of downward expansion, not a hard gate.
-    r.gateRangeDb   = -std::clamp ((40.0f - r.snrDb) * 0.6f, 3.0f, 24.0f);
+    // Depth has to cover the room as well as the hiss: on a live booth the
+    // thing being pulled down between words is reverb, not noise.
+    r.gateRangeDb   = -std::clamp (std::max ((40.0f - r.snrDb) * 0.6f,
+                                             r.reverbRatio * 18.0f), 3.0f, 24.0f);
     r.gateAttackMs  = 1.5f;
     // release tracks the room so gating doesn't chop the natural tail
-    r.gateReleaseMs = std::clamp (r.rt60Seconds * 1000.0f * 0.8f, 90.0f, 600.0f);
+    // Deliberately NOT tied to RT60. The old rule stretched the release to
+    // 600 ms on a live room, which is exactly the case where the expander needs
+    // to be closing inside the gap -- it could never act before the next word.
+    // What stops it chopping the natural decay is the soft expansion ratio, not
+    // a slow release.
+    r.gateReleaseMs = std::clamp (60.0f + r.reverbRatio * 60.0f, 60.0f, 140.0f);
 
     // ---- de-noise / de-verb: aggression scales with how bad the input is ----
     // Clean source -> near zero. Bad bedroom recording -> pushes hard.

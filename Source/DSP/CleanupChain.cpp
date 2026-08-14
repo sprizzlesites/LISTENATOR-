@@ -48,6 +48,7 @@ void SpectralEngine::prepare (double sampleRate)
     // excitation rather than the same syllable.
     historyDelay = juce::jlimit (4, 40, (int) (0.064 * sampleRate / hop));
     magHistory.assign ((size_t) historyDelay + 1, std::vector<float> (numBins, 0.0f));
+    lateAccum.assign (numBins, 0.0f);
     historyPos = 0;
     prevGain.assign    (numBins, 1.0f);
     mag.assign         (numBins, 0.0f);
@@ -63,6 +64,7 @@ void SpectralEngine::reset()
     std::fill (inputRing.begin(),  inputRing.end(),  0.0f);
     std::fill (outputRing.begin(), outputRing.end(), 0.0f);
     std::fill (noiseMin.begin(), noiseMin.end(), 1.0e9f);
+    std::fill (lateAccum.begin(), lateAccum.end(), 0.0f);
     std::fill (prevGain.begin(), prevGain.end(), 1.0f);
     pos = 0;
     samplesUntilFrame = hop;
@@ -120,16 +122,22 @@ void SpectralEngine::setDeverbDecay (float rt60) noexcept
 {
     if (rt60 <= 0.01f) { deverbDecayPerHop = 0.0f; return; }
 
-    // How far the late field has decayed across the history delay.
-    const float delaySeconds = (float) (historyDelay * hop) / (float) sr;
-    deverbDecayPerHop = juce::jlimit (0.05f, 0.95f,
-                                      std::pow (10.0f, -3.0f * delaySeconds / rt60));
+    // Decay across ONE HOP, because that is how often the accumulator is
+    // advanced. Computing it over the history delay instead (a dozen hops) made
+    // the estimate collapse an order of magnitude too fast, so by the time a gap
+    // arrived there was nothing left to subtract.
+    const float hopSeconds = (float) hop / (float) sr;
+    deverbDecayPerHop = juce::jlimit (0.05f, 0.995f,
+                                      std::pow (10.0f, -3.0f * hopSeconds / rt60));
 }
 
-void SpectralEngine::setTailRatio (float ratio) noexcept
+void SpectralEngine::setTailDb (float tailDb) noexcept
 {
-    // Direct-to-reverberant scaling for the delayed estimate.
-    deverbGamma = juce::jlimit (0.0f, 0.9f, ratio);
+    // A -15 dB tail means the late field sits at 0.18 of the direct amplitude.
+    // During sustained delivery the delayed frame is about as loud as the
+    // current one, so this fraction IS the proportion that gets subtracted --
+    // which is why putting a 0..1 severity score here removes 89% of the voice.
+    deverbGamma = juce::jlimit (0.02f, 0.5f, dbToGain (juce::jlimit (-40.0f, -6.0f, tailDb)));
 }
 
 void SpectralEngine::process (float* block, int numSamples)
@@ -248,17 +256,42 @@ void SpectralEngine::processFrame()
     {
         const auto& past = magHistory[(size_t) ((historyPos + 1) % (int) magHistory.size())];
 
+        // A real tail is everything the room is still radiating from ALL past
+        // excitation, decaying exponentially -- not one delayed frame. A single
+        // tap under-estimates a dense passage badly, because the energy still
+        // ringing there came from many syllables, not just the last one.
+        const float decay = deverbDecayPerHop;
+        const float norm  = 1.0f - decay;
+
+        // How deep subtraction is allowed to go scales with how live the room
+        // measured. A dead room gets barely touched; a bad booth earns more.
+        const float maxCut = juce::jlimit (0.35f, 0.75f, 0.35f + deverb * 0.5f);
+        const float floorG = 1.0f - maxCut;
+
         for (int b = 0; b < numBins; ++b)
         {
+            lateAccum[(size_t) b] = decay * lateAccum[(size_t) b] + past[(size_t) b];
+
             const float m = mag[(size_t) b];
             if (m <= 1.0e-9f) continue;
 
-            const float late = past[(size_t) b] * deverbGamma * deverbDecayPerHop;
+            const float late = lateAccum[(size_t) b] * norm * deverbGamma;
 
-            // Never take out more than half the bin: over-subtraction on a
-            // dense mid-word spectrum is what produces the watery artifact.
-            const float subtract = juce::jmin (late * deverb, m * 0.5f);
-            gains[(size_t) b] *= juce::jmax (m - subtract, m * 0.3f) / m;
+            // Only subtract where the room is actually what's left. While a bin
+            // is holding steady or rising, the direct sound dominates and there
+            // is nothing to remove; it is once the bin falls away from its own
+            // recent level that what remains is tail.
+            //
+            // Without this the heaviest subtraction lands on the last 100 ms of
+            // every syllable -- the voice's own decay, which is precisely the
+            // part that must survive.
+            const float ref = past[(size_t) b];
+            const float fall = ref > 1.0e-9f
+                             ? juce::jlimit (0.0f, 1.0f, 1.0f - m / ref)
+                             : 0.0f;
+
+            const float subtract = juce::jmin (late * deverb * fall, m * maxCut);
+            gains[(size_t) b] *= juce::jmax (m - subtract, m * floorG) / m;
         }
     }
 
@@ -734,13 +767,6 @@ void CleanupChain::prepare (double sampleRate, int maxBlockSize, int numChannels
     comp.prepare (sampleRate, channels);
     deEss.prepare (sampleRate, maxBlock, channels);
 
-    // Cleanup-half pitch repair: slow, wide dead zone, partial strength. This
-    // is intonation repair, not an effect -- it should never be audible as one.
-    repair.prepare (sampleRate, maxBlock);
-    repair.setRetuneMs (220.0f);
-    repair.setStrength (0.5f);
-    repair.setDeadZoneCents (22.0f);
-
     limiter.prepare (sampleRate, maxBlock, channels);
     limiter.setThresholdDb (-0.8f);
 
@@ -760,11 +786,11 @@ void CleanupChain::reset()
     plosive.reset();
     comp.reset();
     deEss.reset();
-    repair.reset();
     limiter.reset();
     gateEnv = 1.0f;
     gateGain = 1.0f;
     gateOpen = false;
+    progEnv = 0.0f;
 }
 
 void CleanupChain::applyAnalysis (const AnalysisResult& a)
@@ -835,7 +861,7 @@ void CleanupChain::updateFilters()
         spectral[ch].setDenoiseAmount (bypass.deNoise ? 0.0f : analysis.denoiseAmount * clAmt);
         spectral[ch].setDeverbAmount  (bypass.deVerb  ? 0.0f : analysis.deverbAmount  * clAmt);
         spectral[ch].setDeverbDecay   (analysis.rt60Seconds);
-        spectral[ch].setTailRatio     (analysis.reverbRatio);
+        spectral[ch].setTailDb        (analysis.tailDb);
         spectral[ch].setHarmonicSpacing (analysis.medianF0Hz);
         spectral[ch].setResonanceDepth (bypass.resonance ? 0.0f : 0.55f * eqAmt);
     }
@@ -857,6 +883,13 @@ void CleanupChain::updateFilters()
     gateRangeLin    = dbToGain (analysis.gateRangeDb);
     gateAttackCoef  = timeCoef (analysis.gateAttackMs,  sr);
     gateReleaseCoef = timeCoef (analysis.gateReleaseMs, sr);
+
+    // Relative threshold sits just above the measured tail, so what gets pulled
+    // down is the room rather than the performance. tailDb is negative and is
+    // relative to the level just before each gap.
+    relativeOffsetLin = dbToGain (juce::jlimit (-24.0f, -8.0f, analysis.tailDb + 3.0f));
+    progReleaseCoef   = timeCoef (1200.0f, sr);   // programme level, not syllables
+    expanderRatio     = juce::jlimit (1.5f, 3.5f, 1.5f + analysis.reverbRatio * 2.0f);
 }
 
 int CleanupChain::getLatencySamples() const noexcept
@@ -866,8 +899,6 @@ int CleanupChain::getLatencySamples() const noexcept
     int latency = 0;
     if (! bypass.deNoise || ! bypass.deVerb || ! bypass.resonance)
         latency += SpectralEngine::getLatencySamples();
-    if (! bypass.pitchRepair)
-        latency += repair.getLatencySamples();
     if (! bypass.limiter)
         latency += limiter.getLatencySamples();
     return latency;
@@ -902,7 +933,7 @@ void CleanupChain::process (juce::AudioBuffer<float>& buffer)
     for (int ch = 0; ch < numCh; ++ch)
         spectral[ch].process (buffer.getWritePointer (ch), numSamples);
 
-    // 3. gate, threshold from the measured noise floor, with hysteresis
+    // 3. gate + programme-relative expander
     if (! bypass.gate)
     {
         for (int i = 0; i < numSamples; ++i)
@@ -911,12 +942,30 @@ void CleanupChain::process (juce::AudioBuffer<float>& buffer)
             for (int ch = 0; ch < numCh; ++ch)
                 detect = juce::jmax (detect, std::abs (buffer.getSample (ch, i)));
 
-            // Separate open/close thresholds: a single one chatters when the
-            // signal sits right on it.
-            if (! gateOpen && detect > gateOpenLin)  gateOpen = true;
-            else if (gateOpen && detect < gateCloseLin) gateOpen = false;
+            // Programme level: rises immediately, forgets slowly. This is the
+            // reference the relative threshold hangs off, so it has to track
+            // takes rather than syllables.
+            progEnv = juce::jmax (detect, progEnv * progReleaseCoef);
 
-            const float target = gateOpen ? 1.0f : gateRangeLin;
+            // Whichever threshold is higher does the work.
+            const float relThresh = progEnv * relativeOffsetLin;
+            const float openAt    = juce::jmax (gateOpenLin, relThresh);
+            const float closeAt   = openAt * 0.5f;             // 6 dB hysteresis
+
+            if (! gateOpen && detect > openAt)       gateOpen = true;
+            else if (gateOpen && detect < closeAt)   gateOpen = false;
+
+            float target = 1.0f;
+            if (! gateOpen)
+            {
+                // Expand rather than switch: a hard gate on a reverberant take
+                // chops the tail off mid-decay and sounds worse than the room.
+                const float over = detect > 1.0e-7f ? gainToDb (detect / juce::jmax (closeAt, 1.0e-7f))
+                                                    : -60.0f;
+                const float reduction = over * (expanderRatio - 1.0f);
+                target = juce::jmax (gateRangeLin, dbToGain (reduction));
+            }
+
             const float coef = target > gateEnv ? gateAttackCoef : gateReleaseCoef;
             gateEnv = coef * gateEnv + (1.0f - coef) * target;
 
@@ -953,14 +1002,6 @@ void CleanupChain::process (juce::AudioBuffer<float>& buffer)
                 for (int i = 0; i < numSamples; ++i)
                     d[i] = toneBands[ch][(size_t) k].processSample (d[i]);
         }
-
-    // 8. transparent intonation repair (mono source drives the chain)
-    if (! bypass.pitchRepair)
-    {
-        repair.process (buffer.getWritePointer (0), numSamples);
-        for (int ch = 1; ch < numCh; ++ch)
-            buffer.copyFrom (ch, 0, buffer, 0, 0, numSamples);
-    }
 
     // 9. safety limiter
     if (! bypass.limiter)

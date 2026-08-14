@@ -46,7 +46,6 @@ namespace pid
     inline constexpr const char* bpComp      = "bpComp";
     inline constexpr const char* bpTone      = "bpTone";
     inline constexpr const char* bpLimiter   = "bpLimiter";
-    inline constexpr const char* bpPitchRepair = "bpPitchRepair";
 
     inline constexpr const char* bpAutoTune   = "bpAutoTune";
     inline constexpr const char* bpDoubler    = "bpDoubler";

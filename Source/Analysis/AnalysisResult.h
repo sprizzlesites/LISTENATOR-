@@ -87,6 +87,9 @@ struct AnalysisResult
     float saturationDrive = 0.0f;   // 0..1 from measured dryness/dynamics
 
     std::vector<Resonance> resonances;              // surgical notches
+    /** Diagnostic: the strongest stationary peaks considered, whether or not
+        they survived de-duplication. Lets an empty result be explained. */
+    std::vector<Resonance> resonanceCandidates;
     std::array<float, numToneBands> measuredLtasDb {};  // what came in
     std::array<float, numToneBands> noiseLtasDb    {};  // spectrum of the quiet frames
     std::array<float, numToneBands> toneMatchDb    {};  // correction we want

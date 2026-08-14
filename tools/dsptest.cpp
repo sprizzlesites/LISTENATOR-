@@ -248,7 +248,7 @@ void testToneMatchCurveIsApplied()
     auto& st = p.getState();
     for (auto* id : { pid::bpHighPass, pid::bpDeNoise, pid::bpDeVerb, pid::bpGate,
                       pid::bpSurgical, pid::bpResonance, pid::bpDeEss, pid::bpComp,
-                      pid::bpLimiter, pid::bpPitchRepair })
+                      pid::bpLimiter })
         st.getParameter (id)->setValueNotifyingHost (1.0f);
     st.getParameter (pid::bpTone)->setValueNotifyingHost (0.0f);
     st.getParameter (pid::effectsBypass)->setValueNotifyingHost (1.0f);
@@ -312,7 +312,7 @@ void testCompressorReducesDynamicRange()
     auto& st = p.getState();
     for (auto* id : { pid::bpHighPass, pid::bpDeNoise, pid::bpDeVerb, pid::bpGate,
                       pid::bpSurgical, pid::bpResonance, pid::bpDeEss, pid::bpTone,
-                      pid::bpLimiter, pid::bpPitchRepair })
+                      pid::bpLimiter })
         st.getParameter (id)->setValueNotifyingHost (1.0f);
     st.getParameter (pid::bpComp)->setValueNotifyingHost (0.0f);
     st.getParameter (pid::effectsBypass)->setValueNotifyingHost (1.0f);
@@ -329,7 +329,7 @@ void testCompressorReducesDynamicRange()
     auto& st2 = p2.getState();
     for (auto* id : { pid::bpHighPass, pid::bpDeNoise, pid::bpDeVerb, pid::bpGate,
                       pid::bpSurgical, pid::bpResonance, pid::bpDeEss, pid::bpTone,
-                      pid::bpLimiter, pid::bpPitchRepair })
+                      pid::bpLimiter })
         st2.getParameter (id)->setValueNotifyingHost (1.0f);
     st2.getParameter (pid::bpComp)->setValueNotifyingHost (0.0f);
     st2.getParameter (pid::effectsBypass)->setValueNotifyingHost (1.0f);
@@ -355,7 +355,7 @@ void testDeEsserActsOnSibilanceOnly()
     auto& st = p.getState();
     for (auto* id : { pid::bpHighPass, pid::bpDeNoise, pid::bpDeVerb, pid::bpGate,
                       pid::bpSurgical, pid::bpResonance, pid::bpComp, pid::bpTone,
-                      pid::bpLimiter, pid::bpPitchRepair })
+                      pid::bpLimiter })
         st.getParameter (id)->setValueNotifyingHost (1.0f);
     st.getParameter (pid::bpDeEss)->setValueNotifyingHost (0.0f);
     st.getParameter (pid::effectsBypass)->setValueNotifyingHost (1.0f);
@@ -409,7 +409,7 @@ void testSpectralEngineIsAudible()
 
     auto& st = p.getState();
     for (auto* id : { pid::bpHighPass, pid::bpGate, pid::bpSurgical, pid::bpDeEss,
-                      pid::bpComp, pid::bpTone, pid::bpLimiter, pid::bpPitchRepair })
+                      pid::bpComp, pid::bpTone, pid::bpLimiter })
         st.getParameter (id)->setValueNotifyingHost (1.0f);
     for (auto* id : { pid::bpDeNoise, pid::bpDeVerb, pid::bpResonance })
         st.getParameter (id)->setValueNotifyingHost (0.0f);
@@ -427,37 +427,6 @@ void testSpectralEngineIsAudible()
            juce::String::formatted ("%.1f dB", outRms - inRms));
 }
 
-void testPitchRepairPreservesSignal()
-{
-    std::printf ("\n[pitch repair] PSOLA must reconstruct, not destroy\n");
-    ListenatorProcessor p;
-    p.prepareToPlay (kSr, kBlock);
-    doListen (p, makeVocal (16.0));
-
-    auto& st = p.getState();
-    for (auto* id : { pid::bpHighPass, pid::bpDeNoise, pid::bpDeVerb, pid::bpGate,
-                      pid::bpSurgical, pid::bpResonance, pid::bpDeEss, pid::bpComp,
-                      pid::bpTone, pid::bpLimiter })
-        st.getParameter (id)->setValueNotifyingHost (1.0f);
-    st.getParameter (pid::bpPitchRepair)->setValueNotifyingHost (0.0f);
-    st.getParameter (pid::effectsBypass)->setValueNotifyingHost (1.0f);
-
-    auto in = makeVocal (6.0);
-    auto out = runThrough (p, in);
-
-    const size_t skip = out.size() / 3;
-    const float inRms = rmsDb (in, skip), outRms = rmsDb (out, skip);
-
-    // Grains written behind the read pointer produce silence; COLA
-    // reconstruction should hold level to within a couple of dB.
-    check (std::abs (outRms - inRms) < 4.0f, "level preserved through PSOLA",
-           juce::String::formatted ("in %.1f dB -> out %.1f dB", inRms, outRms));
-
-    int bad = 0;
-    for (float v : out) if (! std::isfinite (v)) ++bad;
-    check (bad == 0, "no NaN from the grain scheduler");
-}
-
 void testTrimKnobsHaveEffect()
 {
     std::printf ("\n[trims] knobs must change the audio, not just the state\n");
@@ -470,7 +439,7 @@ void testTrimKnobsHaveEffect()
 
         auto& st = p.getState();
         for (auto* id : { pid::bpHighPass, pid::bpDeNoise, pid::bpDeVerb, pid::bpGate,
-                          pid::bpDeEss, pid::bpComp, pid::bpLimiter, pid::bpPitchRepair })
+                          pid::bpDeEss, pid::bpComp, pid::bpLimiter })
             st.getParameter (id)->setValueNotifyingHost (1.0f);
         st.getParameter (pid::effectsBypass)->setValueNotifyingHost (1.0f);
 
@@ -534,7 +503,6 @@ int main()
     testToneMatchCurveIsApplied();
     testCompressorReducesDynamicRange();
     testDeEsserActsOnSibilanceOnly();
-    testPitchRepairPreservesSignal();
     testTrimKnobsHaveEffect();
     testHalfBypassesAreIndependent();
     testNoRunawayOrNaN();

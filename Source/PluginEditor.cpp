@@ -111,6 +111,8 @@ void ListenatorEditor::addModule (juce::OwnedArray<ModuleStrip>& rack, const cha
 
 void ListenatorEditor::buildRack()
 {
+    addModule (cleanupModules, pid::bpDeClip,    "DE-CLIP",      mintGreen);
+    addModule (cleanupModules, pid::bpPlosive,   "PLOSIVE GUARD",mintGreen);
     addModule (cleanupModules, pid::bpHighPass,  "HIGH-PASS",    mintGreen);
     addModule (cleanupModules, pid::bpDeNoise,   "DE-NOISE",     mintGreen);
     addModule (cleanupModules, pid::bpDeVerb,    "DE-VERB",      mintGreen);

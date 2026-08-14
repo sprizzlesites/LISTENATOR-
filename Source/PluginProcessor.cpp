@@ -70,7 +70,6 @@ juce::AudioProcessorValueTreeState::ParameterLayout ListenatorProcessor::createL
     bp (pid::bpSurgical, "Bypass Surgical");   bp (pid::bpResonance,"Bypass Resonance");
     bp (pid::bpDeEss,    "Bypass De-Ess");     bp (pid::bpComp,     "Bypass Comp");
     bp (pid::bpTone,     "Bypass Tone");       bp (pid::bpLimiter,  "Bypass Limiter");
-    bp (pid::bpPitchRepair, "Bypass Pitch Repair");
 
     bp (pid::bpAutoTune,  "Bypass Tune");      bp (pid::bpDoubler,  "Bypass Doubler");
     bp (pid::bpSaturation,"Bypass Sat");       bp (pid::bpExciter,  "Bypass Exciter");
@@ -175,7 +174,6 @@ void ListenatorProcessor::pullParameters()
     cb.compressor = flag (pid::bpComp);
     cb.toneMatch  = flag (pid::bpTone);
     cb.limiter    = flag (pid::bpLimiter);
-    cb.pitchRepair = flag (pid::bpPitchRepair);
 
     CleanupTrims ct;
     ct.eqAmount      = raw (pid::eqAmount);

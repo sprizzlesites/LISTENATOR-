@@ -63,6 +63,51 @@ Stats measure (const std::vector<float>& x, double sr)
     return s;
 }
 
+/** Median level in the 80-250 ms window after a speech offset, relative to the
+    level just before it -- the same quantity the analyser uses to decide how
+    live the room is. Running it on the OUTPUT says whether de-verb worked. */
+float measureTailDb (const std::vector<float>& x, double sr, float noiseFloorDb)
+{
+    const int frameLen = std::max (16, (int) (0.005 * sr));
+    std::vector<float> envDb;
+    for (size_t i = 0; i + (size_t) frameLen <= x.size(); i += (size_t) frameLen)
+    {
+        double a = 0.0;
+        for (int k = 0; k < frameLen; ++k) a += (double) x[i + (size_t) k] * x[i + (size_t) k];
+        envDb.push_back (10.0f * (float) std::log10 (std::max (a / frameLen, 1e-20)));
+    }
+    if (envDb.size() < 40) return -99.0f;
+
+    const float frameSec = (float) frameLen / (float) sr;
+    const int pre   = std::max (1, (int) (0.100 / frameSec));
+    const int gapLo = std::max (1, (int) (0.080 / frameSec));
+    const int gapHi = std::max (2, (int) (0.250 / frameSec));
+
+    std::vector<float> ratios;
+    for (size_t i = (size_t) pre; i + (size_t) gapHi < envDb.size(); ++i)
+    {
+        const float before = envDb[i];
+        if (before < noiseFloorDb + 18.0f) continue;
+        if (envDb[i + (size_t) gapLo] > before - 6.0f) continue;
+
+        float preAcc = 0.0f;
+        for (int k = 0; k < pre; ++k) preAcc += envDb[i - (size_t) k];
+        preAcc /= (float) pre;
+
+        float tailAcc = 0.0f, tailMax = -200.0f; int n = 0;
+        for (int k = gapLo; k <= gapHi; ++k)
+        { const float v = envDb[i + (size_t) k]; tailAcc += v; tailMax = std::max (tailMax, v); ++n; }
+        tailAcc /= (float) std::max (1, n);
+
+        if (tailMax > before - 6.0f) continue;
+        if (tailAcc < noiseFloorDb + 3.0f) continue;
+        ratios.push_back (tailAcc - preAcc);
+    }
+    if (ratios.empty()) return -99.0f;
+    std::sort (ratios.begin(), ratios.end());
+    return ratios[ratios.size() / 2];
+}
+
 void printLevelMap (const std::vector<float>& x, double sr, const char* label)
 {
     std::printf ("  %s level map (2 s cells, dBFS RMS):\n    ", label);
@@ -146,7 +191,10 @@ void dumpAnalysis (const AnalysisResult& a)
                  a.compPeakThreshDb, a.compPeakRatio, a.compPeakAttackMs, a.compPeakReleaseMs);
     std::printf ("  makeup    %.1f dB     saturation drive %.2f\n", a.makeupGainDb, a.saturationDrive);
 
-    std::printf ("  resonances (%d):", (int) a.resonances.size());
+    std::printf ("  res cands:");
+    for (const auto& c : a.resonanceCandidates)
+        std::printf ("  %.0fHz/%.1fdB/agree%.0f", c.frequencyHz, -c.gainDb, c.q);
+    std::printf ("\n  resonances (%d):", (int) a.resonances.size());
     for (const auto& r : a.resonances)
         std::printf ("  %.0fHz/%.1fdB/Q%.1f", r.frequencyHz, r.gainDb, r.q);
     std::printf ("\n  tone match (dB per 1/3-oct band, 20 Hz..20 kHz):\n    ");
@@ -199,8 +247,14 @@ int main (int argc, char** argv)
     }
 
     // ---- run the two renders ----------------------------------------------
-    struct Variant { const char* name; bool cleanup; bool effects; };
-    const Variant variants[] = { { "cleanup", true, false }, { "full", true, true } };
+    struct Variant { const char* name; bool cleanup; bool effects; bool deverbOnly; };
+    std::vector<Variant> variants { { "cleanup", true, false, false },
+                                    { "full",    true, true,  false } };
+    // isolate the de-verb so its contribution is measurable on its own
+    if (args.contains ("--diag"))
+        variants.push_back ({ "deverbonly", true, false, true });
+    if (args.contains ("--no-deverb"))
+        variants[0].name = "cleanup-nodeverb";
 
     for (const auto& variant : variants)
     {
@@ -213,6 +267,16 @@ int main (int argc, char** argv)
 
         setP (pid::cleanupBypass, variant.cleanup ? 0.0f : 1.0f);
         setP (pid::effectsBypass, variant.effects ? 0.0f : 1.0f);
+
+        if (args.contains ("--no-deverb"))
+            setP (pid::bpDeVerb, 1.0f);
+
+        if (variant.deverbOnly)
+            for (auto* id : { pid::bpDeClip, pid::bpPlosive, pid::bpHighPass,
+                              pid::bpDeNoise, pid::bpGate, pid::bpSurgical,
+                              pid::bpResonance, pid::bpComp, pid::bpDeEss,
+                              pid::bpTone, pid::bpLimiter })
+                setP (id, 1.0f);
         if (auto* kp = st.getParameter (pid::keyRoot))
             kp->setValueNotifyingHost (kp->convertTo0to1 ((float) key));
         if (auto* sp = st.getParameter (pid::keyScale))
@@ -289,6 +353,9 @@ int main (int argc, char** argv)
             outR.erase (outR.begin(), outR.begin() + (long) cut);
         }
 
+        const float outTail = measureTailDb (outL, sr, p.getAnalysisResult().noiseFloorDb);
+        std::printf ("  tail after processing: %.1f dB (source was %.1f dB)\n",
+                     outTail, p.getAnalysisResult().tailDb);
         auto s = measure (outL, sr);
         std::printf ("  declipped %d samples   plosive guard max %.1f dB (LF transient ratio %.1f)\n",
                      p.getDeclippedCount(), worstPlosive, p.getPlosivePeakBoost());

@@ -1,7 +1,7 @@
 #pragma once
 #include <juce_dsp/juce_dsp.h>
 #include "Analysis/AnalysisResult.h"
-#include "PitchCorrector.h"
+#include "PitchCorrector.h"   // Scale enum only; the cleanup half does no pitch work
 
 namespace listenator
 {
@@ -12,7 +12,7 @@ struct CleanupBypass
     bool deClip = false, plosive = false;
     bool highPass = false, deNoise = false, deVerb = false, gate = false;
     bool surgicalEq = false, resonance = false, deEss = false;
-    bool compressor = false, toneMatch = false, pitchRepair = false, limiter = false;
+    bool compressor = false, toneMatch = false, limiter = false;
 
     bool operator== (const CleanupBypass& o) const noexcept
     {
@@ -20,7 +20,7 @@ struct CleanupBypass
             && highPass == o.highPass && deNoise == o.deNoise && deVerb == o.deVerb
             && gate == o.gate && surgicalEq == o.surgicalEq && resonance == o.resonance
             && deEss == o.deEss && compressor == o.compressor && toneMatch == o.toneMatch
-            && pitchRepair == o.pitchRepair && limiter == o.limiter;
+            && limiter == o.limiter;
     }
     bool operator!= (const CleanupBypass& o) const noexcept { return ! (*this == o); }
 };
@@ -64,8 +64,11 @@ public:
     void setDenoiseAmount (float a) noexcept  { denoise = juce::jlimit (0.0f, 1.0f, a); }
     void setDeverbAmount  (float a) noexcept  { deverb  = juce::jlimit (0.0f, 1.0f, a); }
     void setDeverbDecay   (float rt60) noexcept;
-    /** 0..1 measure of how much tail is audible between words. */
-    void setTailRatio     (float ratio) noexcept;
+    /** Late-field level relative to direct, in dB (negative). This is an
+        AMPLITUDE relationship, not a 0..1 severity score -- feeding a
+        normalised liveness value here tells the subtractor that most of every
+        sustained syllable is reverb, and it removes the voice. */
+    void setTailDb        (float tailDb) noexcept;
     /** Widens the resonance envelope so a harmonic series isn't flattened. */
     void setHarmonicSpacing (float f0Hz) noexcept;
     void setResonanceDepth (float d) noexcept { resonanceDepth = juce::jmax (0.0f, d); }
@@ -97,6 +100,7 @@ private:
     // continuous delivery an envelope tracks the direct sound almost exactly,
     // so subtracting it removes the voice instead of the room.
     std::vector<std::vector<float>> magHistory;
+    std::vector<float> lateAccum;      // running estimate of the decaying tail
     int   historyPos = 0, historyDelay = 12;
     float deverbGamma = 0.0f;
 
@@ -259,9 +263,12 @@ private:
 //==============================================================================
 /** The corrective half.
 
-        HPF -> [de-noise + de-verb + resonance, one STFT] -> gate
-             -> surgical EQ -> compression -> de-ess -> tone match
-             -> pitch repair -> limiter
+        de-clip -> plosive guard -> HPF
+             -> [de-noise + de-verb + resonance, one STFT] -> gate
+             -> surgical EQ -> compression -> de-ess -> tone match -> limiter
+
+    The corrective half does no pitch work at all: correcting intonation is an
+    effect, and it belongs on the other side of the bypass.
 
     De-essing sits after compression (compression amplifies sibilance) and
     before the tone-match stage, which is where any additive HF comes from.
@@ -309,13 +316,26 @@ private:
     SpectralEngine spectral[2];
     DualCompressor comp;
     DeEsser        deEss;
-    PitchCorrector repair;
 
-    // gate, with hysteresis so it can't chatter on the threshold
+    // Gate / expander.
+    //
+    // Two thresholds, and the operating one is whichever sits higher:
+    //   absolute -- from the measured noise floor, kills hiss in true silence
+    //   relative -- tracks the running programme level, pulls down the room
+    //               tail between words
+    //
+    // The relative one is what a fixed gate cannot do on this material. With
+    // punch-ins recorded 15 dB apart, the reverb tail of a loud take sits at
+    // the same absolute level as a quiet take's direct sound, so no fixed
+    // threshold can separate them. One that follows the programme can.
     float gateOpenLin = 0.0f, gateCloseLin = 0.0f, gateGain = 1.0f;
     float gateAttackCoef = 0.0f, gateReleaseCoef = 0.0f, gateRangeLin = 0.1f;
     float gateEnv = 1.0f;
     bool  gateOpen = false;
+
+    float progEnv = 0.0f, progReleaseCoef = 0.0f;
+    float relativeOffsetLin = 0.0f;   // threshold as a fraction of programme
+    float expanderRatio = 2.0f;
 
     BrickwallLimiter limiter;
 };
