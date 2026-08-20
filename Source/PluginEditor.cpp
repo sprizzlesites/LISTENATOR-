@@ -98,8 +98,8 @@ void ListenatorEditor::addTrim (TrimKnob& k, const char* paramId, const juce::St
     k.attach = std::make_unique<SliderAttach> (proc.getState(), paramId, k.slider);
 }
 
-void ListenatorEditor::addModule (juce::OwnedArray<ModuleStrip>& rack, const char* paramId,
-                                  const juce::String& name, juce::Colour accent)
+ModuleStrip* ListenatorEditor::addModule (juce::OwnedArray<ModuleStrip>& rack, const char* paramId,
+                                          const juce::String& name, juce::Colour accent)
 {
     auto* strip = new ModuleStrip (name, accent);
     rack.add (strip);
@@ -107,6 +107,7 @@ void ListenatorEditor::addModule (juce::OwnedArray<ModuleStrip>& rack, const cha
 
     moduleAttachments.add (new std::unique_ptr<ButtonAttach> (
         std::make_unique<ButtonAttach> (proc.getState(), paramId, strip->bypassButton)));
+    return strip;
 }
 
 void ListenatorEditor::buildRack()
@@ -117,10 +118,13 @@ void ListenatorEditor::buildRack()
     addModule (cleanupModules, pid::bpDeNoise,   "DE-NOISE",     mintGreen);
     addModule (cleanupModules, pid::bpDeVerb,    "DE-VERB",      mintGreen);
     addModule (cleanupModules, pid::bpGate,      "GATE",         mintGreen);
+    upwardStrip =
     addModule (cleanupModules, pid::bpUpward,    "UP-EXPANDER",  mintGreen);
     addModule (cleanupModules, pid::bpSurgical,  "SURGICAL EQ",  mintGreen);
     addModule (cleanupModules, pid::bpResonance, "RESONANCE",    mintGreen);
+    compStrip =
     addModule (cleanupModules, pid::bpComp,      "COMPRESSOR",   mintGreen);
+    deEssStrip =
     addModule (cleanupModules, pid::bpDeEss,     "DE-ESSER",     mintGreen);
     addModule (cleanupModules, pid::bpTone,      "TONE MATCH",   mintGreen);
     addModule (cleanupModules, pid::bpLimiter,   "LIMITER",      mintGreen);
@@ -153,12 +157,13 @@ void ListenatorEditor::timerCallback()
     pitchGauge.setValue (juce::jlimit (0.0f, 1.0f, hz / 800.0f),
                          hz > 1.0f ? juce::String ((int) hz) + " Hz" : "--");
 
-    // module activity lamps
-    if (! cleanupModules.isEmpty())
-    {
-        cleanupModules[6]->setActivity (juce::jlimit (0.0f, 1.0f, -gr / 12.0f));
-        cleanupModules[7]->setActivity (juce::jlimit (0.0f, 1.0f, -de / 8.0f));
-    }
+    // Module activity lamps, held by pointer rather than by rack index: an
+    // index-keyed lamp quietly starts reporting the wrong module the moment a
+    // stage is inserted above it.
+    if (compStrip  != nullptr) compStrip->setActivity  (juce::jlimit (0.0f, 1.0f, -gr / 12.0f));
+    if (deEssStrip != nullptr) deEssStrip->setActivity (juce::jlimit (0.0f, 1.0f, -de / 8.0f));
+    if (upwardStrip != nullptr)
+        upwardStrip->setActivity (juce::jlimit (0.0f, 1.0f, proc.getUpwardBoostDb() / 8.0f));
 
     const float lvl = juce::jlimit (0.0f, 1.0f, (proc.getOutputLevelDb() + 60.0f) / 60.0f);
     tubeGlow = tubeGlow * 0.8f + lvl * 0.2f;
@@ -233,11 +238,19 @@ void ListenatorEditor::resized()
     {
         auto strips = area.removeFromTop (area.getHeight() - 66);
         strips.removeFromTop (26);                    // header plate
-        const int n = juce::jmax (1, rack.size());
-        const int h = juce::jmin (24, strips.getHeight() / n);
 
-        for (auto* s : rack)
-            s->setBounds (strips.removeFromTop (h).reduced (3, 1));
+        // Two columns once the list is long enough that a single one would
+        // squeeze the rows below the height their switch graphic needs.
+        const int n    = juce::jmax (1, rack.size());
+        const int cols = n > 9 ? 2 : 1;
+        const int rows = (n + cols - 1) / cols;
+        const int h    = juce::jmin (24, strips.getHeight() / rows);
+        const int colW = strips.getWidth() / cols;
+
+        for (int i = 0; i < rack.size(); ++i)
+            rack[i]->setBounds (juce::Rectangle<int> (strips.getX() + (i / rows) * colW,
+                                                      strips.getY() + (i % rows) * h,
+                                                      colW, h).reduced (3, 1));
 
         // trim knob row underneath
         if (! trims.empty())

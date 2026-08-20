@@ -33,8 +33,8 @@ private:
     };
 
     void addTrim (TrimKnob&, const char* paramId, const juce::String& text);
-    void addModule (juce::OwnedArray<ModuleStrip>&, const char* paramId,
-                    const juce::String& name, juce::Colour accent);
+    ModuleStrip* addModule (juce::OwnedArray<ModuleStrip>&, const char* paramId,
+                            const juce::String& name, juce::Colour accent);
 
     ListenatorProcessor& proc;
     DoofLookAndFeel lnf;
@@ -58,6 +58,9 @@ private:
     LevelStrip outputStrip { "OUT" };
 
     juce::OwnedArray<ModuleStrip> cleanupModules, effectsModules;
+    ModuleStrip* compStrip = nullptr;
+    ModuleStrip* deEssStrip = nullptr;
+    ModuleStrip* upwardStrip = nullptr;
     juce::OwnedArray<std::unique_ptr<ButtonAttach>> moduleAttachments;
 
     TrimKnob eqTrim, compTrim, deEssTrim, cleanTrim;
