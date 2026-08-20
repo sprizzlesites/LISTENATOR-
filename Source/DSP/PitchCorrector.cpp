@@ -126,11 +126,23 @@ void PitchCorrector::emitGrain (int centreOffsetFromWrite, int grainLen)
     grainLen = juce::jlimit (32, maxGrain, grainLen);
     const int half = grainLen / 2;
 
-    // Source is centred one period behind the write head so the whole grain
-    // is already buffered. Destination is `latency` ahead of the read point,
-    // which guarantees every sample is written before it is read.
+    // Source is centred one period behind the write head so the whole grain is
+    // already buffered.
+    //
+    // The destination is the SAME ring position, not `latency` ahead of the
+    // write head. The output ring is already read `latency` behind the write
+    // head, so writing a further `latency` ahead delayed everything by twice
+    // that -- measured at 4352 samples against the 2048 this class reports,
+    // which is 48 ms of the plugin sitting in the wrong place in the host.
+    // Writing at the source position makes the delay exactly `latency`, and
+    // independent of the singer's pitch: the old geometry also added the grain
+    // period on top, so the true figure moved with the note.
+    //
+    // Margin still holds: the earliest sample a grain touches is
+    // srcCentre - grainLen/2, and with maxGrain 2048 that is at worst 1024
+    // behind the write head, where the read point is 2048 behind it.
     const int srcCentre = (pos + centreOffsetFromWrite) & mask;
-    const int dstCentre = (pos + latency) & mask;
+    const int dstCentre = srcCentre;
     const int stride    = (maxGrain - 1) / juce::jmax (1, grainLen - 1);
 
     for (int i = 0; i < grainLen; ++i)

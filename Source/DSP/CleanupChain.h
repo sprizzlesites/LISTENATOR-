@@ -310,6 +310,50 @@ private:
 };
 
 //==============================================================================
+/** Takes the edge off attack transients without touching the body of a word.
+
+    A corrective chain adds transient emphasis whether or not anyone asked for
+    it: the tone stage lifts the top end to meet the target curve, and a
+    consonant is mostly top end, so it comes up more than the vowel behind it.
+    Measured against the source, the chain was making the leading 15 ms of a
+    word 0.8 dB louder relative to the word, and 1.1 dB above 5 kHz.
+
+    A de-esser cannot fix that. It reduces the LEVEL of a sibilant, but it
+    reduces the attack and the body together, so the ratio between them -- which
+    is what "spitty" actually means -- survives. What flattens that ratio is a
+    detector that compares a fast envelope against a slow one and acts only on
+    the difference.
+
+    Lookahead is not optional here. Without it the reduction can only start
+    after the transient has arrived, which leaves the first millisecond -- the
+    loudest part -- untouched.
+*/
+class TransientSoftener
+{
+public:
+    void prepare (double sampleRate, int maxBlockSize, int numChannels);
+    void reset();
+    void setParams (const AnalysisResult&, float amount);
+
+    void process (juce::AudioBuffer<float>&);
+
+    int   getLatencySamples() const noexcept { return lookahead; }
+    float getReductionDb()    const noexcept { return lastReductionDb; }
+
+private:
+    double sr = 44100.0;
+    int    numCh = 1, lookahead = 0, writeIdx = 0;
+    juce::AudioBuffer<float> delayLine;
+
+    float fastEnv = 0.0f, slowEnv = 0.0f;
+    float fastAtk = 0.0f, fastRel = 0.0f, slowAtk = 0.0f, slowRel = 0.0f;
+    float gain = 1.0f, gainAtk = 0.0f, gainRel = 0.0f;
+
+    float threshDb = 4.0f, depthDb = 0.0f, slope = 0.5f;
+    float lastReductionDb = 0.0f;
+};
+
+//==============================================================================
 /** Lookahead brickwall limiter.
 
     juce::dsp::Limiter is deliberately not used here: it bolts on a fixed 4:1
@@ -374,7 +418,14 @@ public:
     void setBase (const std::array<float, numToneBands>& baseDb, float amount);
     void setNoiseFloorDb (float db) noexcept { noiseFloorDb = db; }
 
+    /** Filters only. */
     void process (juce::AudioBuffer<float>&);
+    /** Feeds the loop what it should be matching. Split from process() so the
+        measurement can be taken at the END of the chain rather than at this
+        stage's own output -- otherwise anything after it is invisible to the
+        loop and the finished signal misses the target by whatever that stage
+        did. */
+    void observe (const juce::AudioBuffer<float>&);
 
     /** Largest departure the loop has made from the static curve, in dB. */
     float getMaxTrimDb() const noexcept { return maxTrimDb; }
@@ -421,6 +472,7 @@ public:
     void process (juce::AudioBuffer<float>&);
 
     float getReductionDb() const noexcept { return lastReductionDb; }
+    int   getLatencySamples() const noexcept { return lookahead; }
 
 private:
     double sr = 44100.0;
@@ -430,6 +482,13 @@ private:
     float thresholdDb = -28.0f, maxReductionDb = -8.0f, ratio = 4.0f;
     float attackCoef = 0.0f, releaseCoef = 0.0f, env = 0.0f;
     float lastReductionDb = 0.0f;
+
+    // Lookahead on the sibilant band only. A de-esser without it always lets
+    // the leading edge of an ess through at full level -- the detector cannot
+    // know about a transient until it has arrived -- and that leading edge is
+    // exactly the part that reads as a spitty consonant.
+    juce::AudioBuffer<float> sibDelay;
+    int lookahead = 0, delayWrite = 0;
 };
 
 //==============================================================================
@@ -466,6 +525,7 @@ public:
     int   getLatencySamples() const noexcept;
     float getGainReductionDb() const noexcept  { return comp.getGainReductionDb(); }
     float getDeEssReductionDb() const noexcept { return deEss.getReductionDb(); }
+    float getTransientReductionDb() const noexcept { return softener.getReductionDb(); }
     float getGateGain() const noexcept         { return gateGain; }
     float getPlosiveReductionDb() const noexcept { return plosive.getReductionDb(); }
     float getPlosivePeakBoost()  const noexcept  { return plosive.getPeakBoost(); }
@@ -509,6 +569,7 @@ private:
     UpwardExpander upward;
     DualCompressor comp;
     DeEsser        deEss;
+    TransientSoftener softener;
 
     // Gate / expander.
     //

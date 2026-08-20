@@ -154,6 +154,11 @@ void ListenatorProcessor::updateLatency()
     int total = 0;
     if (! lastSkipCleanup) total += cleanup.getLatencySamples();
     if (! lastSkipEffects) total += effects.getLatencySamples();
+    // The output limiter runs whenever either half does, and its lookahead is
+    // just as real as the rest. Leaving it out put the whole plugin 1.5 ms
+    // later than it claimed even with every module switched off.
+    if (! (lastSkipCleanup && lastSkipEffects))
+        total += outputLimiter.getLatencySamples();
     setLatencySamples (total);
 }
 

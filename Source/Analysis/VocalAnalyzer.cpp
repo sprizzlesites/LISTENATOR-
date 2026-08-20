@@ -174,6 +174,7 @@ void VocalAnalyzer::analyse()
     computeSibilance    (r);
     computeResonances   (r);
     computeReverb       (r);
+    computeOnsets       (r);
     deriveSettings      (r);
     computePlosives     (r);
 
@@ -1142,6 +1143,20 @@ void VocalAnalyzer::deriveSettings (AnalysisResult& r)
                      * (1.0f - 1.0f / r.compPeakRatio) * 0.4f;
     r.makeupGainDb = std::clamp (est1 + est2, 0.0f, 10.0f);
 
+    // ---- transient softening -----------------------------------------------
+    // Aimed at bringing the leading edge of a word back to where a well-recorded
+    // one sits, not at flattening it: a vocal with no attack reads as dull long
+    // before it reads as smooth.
+    {
+        constexpr float targetOvershootDb = 5.5f;
+        r.transientThreshDb = 4.0f;
+        // 1.8, not 1.0: the softener acts over a window shorter than the one the
+        // overshoot is measured across, so a dB of depth buys well under a dB
+        // of measured reduction. At unity the stage under-delivered by half.
+        r.transientDepthDb  = -std::clamp ((r.onsetOvershootDb - targetOvershootDb) * 1.8f,
+                                           0.0f, 6.0f);
+    }
+
     // ---- de-esser depth from how far the loud esses overshoot the threshold
     // Depth follows how far the esses stick out of the body, not a fixed value.
     r.deEssMaxReductionDb = -std::clamp (r.sibilantSpreadDb * 0.45f, 3.0f, 14.0f);
@@ -1208,6 +1223,74 @@ void VocalAnalyzer::solveToneFilterGainsFromMeasured (AnalysisResult& r)
     toneTargetFrom (r.measuredLtasDb, r.noiseFloorDb, r.toneMatchDb);
     solveToneGainsInto (r.toneMatchDb, r.toneFilterGainDb);
     r.toneFilterGainDbNoNotch = r.toneFilterGainDb;
+}
+
+//==============================================================================
+/** How far the leading edge of a word sticks out of the word that follows.
+
+    The same quantity the verification harness measures on the output, so the
+    softener depth comes from the recording rather than from a constant, and a
+    take that already has civilised attacks gets no softening at all. */
+void VocalAnalyzer::computeOnsets (AnalysisResult& r)
+{
+    const int frameLen = std::max (8, (int) (0.002 * sr));
+    std::vector<float> envDb;
+    for (int i = 0; i + frameLen <= captureLen; i += frameLen)
+    {
+        float pk = 0.0f;
+        for (int k = 0; k < frameLen; ++k)
+            pk = std::max (pk, std::abs (capture[(size_t) (i + k)]));
+        envDb.push_back (toDb (pk * pk));
+    }
+    if (envDb.size() < 100) return;
+
+    const float frameSec = (float) frameLen / (float) sr;
+    const int quiet = std::max (2, (int) (0.060 / frameSec));
+    const int head  = std::max (2, (int) (0.015 / frameSec));
+    const int bodyA = std::max (3, (int) (0.025 / frameSec));
+    const int bodyB = std::max (6, (int) (0.150 / frameSec));
+
+    std::vector<float> overs;
+    float prog = -60.0f;
+
+    for (size_t i = (size_t) quiet; i + (size_t) bodyB < envDb.size(); ++i)
+    {
+        prog = std::max (envDb[i], prog - 0.02f);
+
+        float pre = -200.0f;
+        for (int k = 1; k <= quiet; ++k) pre = std::max (pre, envDb[i - (size_t) k]);
+        if (pre > prog - 12.0f) continue;            // not a gap
+        if (envDb[i] < pre + 10.0f) continue;        // not an onset
+        if (envDb[i] < prog - 15.0f) continue;       // too quiet to matter
+
+        // Peak against RMS, from the samples themselves. Averaging per-frame
+        // PEAK levels for the body instead makes the body read several dB
+        // hotter than it is, and the overshoot then measures 4.4 dB where the
+        // verification harness -- looking at the same audio -- says 8.1.
+        const size_t base = i * (size_t) frameLen;
+        float peak = 0.0f;
+        for (int k = 0; k < head * frameLen; ++k)
+        {
+            const size_t j = base + (size_t) k;
+            if (j >= (size_t) captureLen) break;
+            peak = std::max (peak, std::abs (capture[j]));
+        }
+
+        double acc = 0.0; int n = 0;
+        for (int k = bodyA * frameLen; k < bodyB * frameLen; ++k)
+        {
+            const size_t j = base + (size_t) k;
+            if (j >= (size_t) captureLen) break;
+            acc += (double) capture[j] * capture[j]; ++n;
+        }
+        if (n == 0 || peak <= 0.0f) continue;
+
+        overs.push_back (toDb (peak * peak) - toDb ((float) (acc / n)));
+        i += (size_t) bodyB;
+    }
+
+    if (overs.size() >= 4)
+        r.onsetOvershootDb = percentile (overs, 0.5f);
 }
 
 //==============================================================================

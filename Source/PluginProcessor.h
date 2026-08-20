@@ -102,6 +102,7 @@ public:
     float getOutputLevelDb()  const noexcept { return outputLevelDb.load(); }
     float getGainReductionDb() const noexcept { return cleanup.getGainReductionDb(); }
     float getDeEssReductionDb() const noexcept { return cleanup.getDeEssReductionDb(); }
+    float getTransientReductionDb() const noexcept { return cleanup.getTransientReductionDb(); }
     float getDetectedHz() const noexcept { return effects.getDetectedHz(); }
     float getPlosiveReductionDb() const noexcept { return cleanup.getPlosiveReductionDb(); }
     int   getDeclippedCount() const noexcept     { return cleanup.getDeclippedCount(); }

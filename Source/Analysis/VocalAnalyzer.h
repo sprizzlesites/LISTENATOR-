@@ -60,6 +60,7 @@ private:
     void computeReverb       (AnalysisResult&);
     void computeLoudness     (AnalysisResult&);
     void computePlosives     (AnalysisResult&);
+    void computeOnsets       (AnalysisResult&);
     void deriveSettings      (AnalysisResult&);
 
     /** Welch-averaged 1/3-octave spectrum of an arbitrary buffer. */

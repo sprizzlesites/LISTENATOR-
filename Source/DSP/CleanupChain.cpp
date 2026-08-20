@@ -376,10 +376,19 @@ void SpectralEngine::processFrame()
     fft.performRealOnlyInverseTransform (frame.data());
     win.multiplyWithWindowingTable (frame.data(), (size_t) size);
 
-    // Overlap-add AHEAD of the read pointer. The read point is `pos - size`,
-    // so writing at `pos` lands a full frame in the future and nothing is lost.
+    // Overlap-add at the positions the frame actually ANALYSED: this frame
+    // covered inputs [pos - size, pos), and that is where its synthesis
+    // belongs.
+    //
+    // Writing at `pos` instead -- a whole frame further ahead -- is safe but
+    // costs an extra `size` of delay for nothing, which measured as 2048
+    // samples of real latency against the 1024 the class reported. The
+    // earliest position written here is `pos - size`, which is exactly the
+    // next sample the reader will take, and by then every frame that overlaps
+    // it (four of them at 75% overlap) has already contributed.
+    const int writeStart = (pos - size) & mask;
     for (int i = 0; i < size; ++i)
-        outputRing[(size_t) ((pos + i) & mask)] += frame[(size_t) i] * olaNorm;
+        outputRing[(size_t) ((writeStart + i) & mask)] += frame[(size_t) i] * olaNorm;
 }
 
 //==============================================================================
@@ -836,6 +845,111 @@ void UpwardExpander::process (juce::AudioBuffer<float>& buffer, const float* gat
 }
 
 //==============================================================================
+// TransientSoftener
+//==============================================================================
+void TransientSoftener::prepare (double sampleRate, int maxBlockSize, int numChannels)
+{
+    sr = sampleRate;
+    numCh = juce::jmax (1, numChannels);
+
+    // 2 ms. The reduction has to be fully in place before the attack arrives,
+    // and the gain attack below is set to reach its target inside that window.
+    lookahead = juce::jmax (8, (int) (0.002 * sampleRate));
+    delayLine.setSize (numCh, lookahead + maxBlockSize + 4);
+
+    fastAtk = timeCoef (0.5f,  sampleRate);
+    fastRel = timeCoef (15.0f, sampleRate);
+    // The reference has to reach the body of the word, and reach it quickly.
+    // At a 120 ms attack it never caught up inside a syllable, so the ratio sat
+    // above the trip point through most of every word and the stage worked as a
+    // broadband compressor -- envelope modulation fell 0.399 to 0.368 while the
+    // onsets it was aimed at got 0.3 dB worse. At 25 ms it tracks the body and
+    // only a genuine attack outruns it.
+    slowAtk = timeCoef (12.0f,  sampleRate);
+    slowRel = timeCoef (120.0f, sampleRate);
+
+    gainAtk = std::exp (-3.0f / (float) lookahead);
+    // Short. A duck that outlasts the transient pulls the body of the word down
+    // with the head, and the RATIO between them -- which is the whole point --
+    // comes out unchanged. It has to be over before the vowel is.
+    gainRel = timeCoef (10.0f, sampleRate);
+    reset();
+}
+
+void TransientSoftener::reset()
+{
+    delayLine.clear();
+    writeIdx = 0;
+    fastEnv = slowEnv = 0.0f;
+    gain = 1.0f;
+    lastReductionDb = 0.0f;
+}
+
+void TransientSoftener::setParams (const AnalysisResult& a, float amount)
+{
+    const float amt = juce::jlimit (0.0f, 2.0f, amount);
+    threshDb = juce::jlimit (2.0f, 12.0f, a.transientThreshDb);
+    depthDb  = juce::jlimit (-12.0f, 0.0f, a.transientDepthDb) * amt;
+    // Reaches full depth about 8 dB past the threshold, so an ordinary word
+    // onset is barely touched and a hard consonant gets the lot.
+    slope = 1.0f / 8.0f;
+}
+
+void TransientSoftener::process (juce::AudioBuffer<float>& buffer)
+{
+    const int n = buffer.getNumSamples();
+    const int ch = juce::jmin (numCh, buffer.getNumChannels());
+    const int len = delayLine.getNumSamples();
+    if (n <= 0 || ch <= 0 || len <= 0) return;
+
+    // Still has to run when it is doing nothing: the delay line is part of the
+    // reported latency, so skipping it would shift the signal.
+    float worst = 0.0f;
+
+    for (int i = 0; i < n; ++i)
+    {
+        float peak = 0.0f;
+        for (int c = 0; c < ch; ++c)
+            peak = juce::jmax (peak, std::abs (buffer.getSample (c, i)));
+
+        auto follow = [] (float& e, float x, float atk, float rel)
+        {
+            const float c = x > e ? atk : rel;
+            e = c * e + (1.0f - c) * x;
+        };
+        follow (fastEnv, peak, fastAtk, fastRel);
+        follow (slowEnv, peak, slowAtk, slowRel);
+
+        float target = 1.0f;
+        if (depthDb < 0.0f && slowEnv > 1.0e-5f)
+        {
+            const float excessDb = gainToDb (fastEnv / slowEnv);
+            if (excessDb > threshDb)
+                target = dbToGain (juce::jmax (depthDb,
+                                               (excessDb - threshDb) * slope * depthDb));
+        }
+
+        const float coef = target < gain ? gainAtk : gainRel;
+        gain = coef * gain + (1.0f - coef) * target;
+        worst = juce::jmin (worst, gainToDb (gain));
+
+        const int readIdx = (writeIdx + len - lookahead) % len;
+        for (int c = 0; c < ch; ++c)
+        {
+            const float delayed = delayLine.getSample (c, readIdx);
+            delayLine.setSample (c, writeIdx, buffer.getSample (c, i));
+            buffer.setSample (c, i, delayed * gain);
+        }
+        writeIdx = (writeIdx + 1) % len;
+    }
+
+    // Worst since the last reset, not since the last block: sampling a
+    // per-block meter after the file has ended reads whatever the trailing
+    // silence did, which is nothing.
+    lastReductionDb = juce::jmin (lastReductionDb, worst);
+}
+
+//==============================================================================
 // BrickwallLimiter
 //==============================================================================
 void BrickwallLimiter::prepare (double sampleRate, int maxBlockSize, int numChannels)
@@ -886,7 +1000,14 @@ void BrickwallLimiter::process (juce::AudioBuffer<float>& buffer)
         const float coef = target < gain ? attackCoef : releaseCoef;
         gain = coef * gain + (1.0f - coef) * target;
 
-        const int readIdx = (writeIdx + 1) % len;
+        // Read exactly `lookahead` samples back. Reading the oldest slot in the
+        // buffer instead delayed by its whole length -- lookahead plus the
+        // block size -- so the gain computed from a peak was applied to audio
+        // ten milliseconds ahead of it, and the peak itself arrived after the
+        // release had started. It also made the plugin's true latency a
+        // function of the host's buffer size while the reported figure stayed
+        // put.
+        const int readIdx = (writeIdx + len - lookahead) % len;
 
         for (int c = 0; c < ch; ++c)
         {
@@ -899,7 +1020,7 @@ void BrickwallLimiter::process (juce::AudioBuffer<float>& buffer)
                                                   delayed * gain));
         }
 
-        writeIdx = readIdx;
+        writeIdx = (writeIdx + 1) % len;
     }
 }
 
@@ -921,11 +1042,21 @@ void DeEsser::prepare (double sampleRate, int maxBlockSize, int numChannels)
     // audio thread.
     sibBuffer.setSize (numChannels, maxBlockSize);
     restBuffer.setSize (numChannels, maxBlockSize);
+
+    // ~2 ms: long enough for the gain to be in place before the ess arrives,
+    // short enough not to smear the consonant it is protecting.
+    lookahead = juce::jmax (8, (int) (0.002 * sampleRate));
+    // Both bands go down the line: delaying only the sibilant one would put
+    // the two halves of the crossover out of step and the split would stop
+    // reconstructing.
+    sibDelay.setSize (numChannels * 2, lookahead + maxBlockSize + 4);
     reset();
 }
 
 void DeEsser::reset()
 {
+    sibDelay.clear();
+    delayWrite = 0;
     lowBand.reset();
     highBand.reset();
     sibBuffer.clear();
@@ -993,10 +1124,24 @@ void DeEsser::process (juce::AudioBuffer<float>& buffer)
         env = coef * env + (1.0f - coef) * target;
         worst = juce::jmin (worst, env);
 
+        // The gain is computed from the sibilant band as it is NOW and applied
+        // to the band as it was `lookahead` samples ago, so the duck is already
+        // in place when the ess arrives instead of chasing it.
         const float g = dbToGain (env);
+        const int len = sibDelay.getNumSamples();
+        const int readIdx = (delayWrite + len - lookahead) % len;
+
         for (int ch = 0; ch < numCh; ++ch)
-            buffer.setSample (ch, i,
-                              restBuffer.getSample (ch, i) + sibBuffer.getSample (ch, i) * g);
+        {
+            const float dRest = sibDelay.getSample (ch, readIdx);
+            const float dSib  = sibDelay.getSample (numCh + ch, readIdx);
+
+            sibDelay.setSample (ch,         delayWrite, restBuffer.getSample (ch, i));
+            sibDelay.setSample (numCh + ch, delayWrite, sibBuffer.getSample (ch, i));
+
+            buffer.setSample (ch, i, dRest + dSib * g);
+        }
+        delayWrite = (delayWrite + 1) % len;
     }
 
     lastReductionDb = worst;
@@ -1095,9 +1240,13 @@ void AdaptiveToneMatch::process (juce::AudioBuffer<float>& buffer)
         }
     }
 
-    // The loop measures the OUTPUT. Measuring the input instead would just
-    // reproduce the open-loop curve with extra steps.
-    pushAnalysis (buffer.getReadPointer (0), n);
+}
+
+void AdaptiveToneMatch::observe (const juce::AudioBuffer<float>& buffer)
+{
+    const int n = buffer.getNumSamples();
+    if (n > 0 && buffer.getNumChannels() > 0)
+        pushAnalysis (buffer.getReadPointer (0), n);
 }
 
 void AdaptiveToneMatch::pushAnalysis (const float* x, int n)
@@ -1296,6 +1445,7 @@ void CleanupChain::prepare (double sampleRate, int maxBlockSize, int numChannels
     gateTrace.assign ((size_t) maxBlock, 1.0f);
     comp.prepare (sampleRate, channels);
     deEss.prepare (sampleRate, maxBlock, channels);
+    softener.prepare (sampleRate, maxBlock, channels);
 
     limiter.prepare (sampleRate, maxBlock, channels);
     limiter.setThresholdDb (-0.8f);
@@ -1319,6 +1469,7 @@ void CleanupChain::reset()
     upward.reset();
     comp.reset();
     deEss.reset();
+    softener.reset();
     limiter.reset();
     gateEnv = 1.0f;
     gateGain = 1.0f;
@@ -1394,6 +1545,7 @@ void CleanupChain::updateFilters()
     upward.setParams (analysis, bypass.upward ? 0.0f : trims.compAmount);
     comp.setParams  (analysis, bypass.compressor ? 0.0f : trims.compAmount);
     deEss.setParams (analysis, bypass.deEss ? 0.0f : trims.deEssAmount);
+    softener.setParams (analysis, bypass.deEss ? 0.0f : trims.deEssAmount);
 
     // Pick the solve that matches whether the notches are actually in circuit:
     // their skirts reach into neighbouring bands, so a curve solved around them
@@ -1429,8 +1581,14 @@ int CleanupChain::getLatencySamples() const noexcept
     if (! haveAnalysis) return 0;
 
     int latency = 0;
-    if (! bypass.deNoise || ! bypass.deVerb || ! bypass.resonance)
+    // Whether the STFT is actually RUNNING, not whether its bypass switches are
+    // off: on a clean source all three of its amounts can be zero, the engine
+    // short-circuits, and reporting its frame anyway asks the host to
+    // compensate for a delay the signal never incurred.
+    if (spectral[0].isActive())
         latency += SpectralEngine::getLatencySamples();
+    if (! bypass.deEss)
+        latency += deEss.getLatencySamples() + softener.getLatencySamples();
     if (! bypass.limiter)
         latency += limiter.getLatencySamples();
     return latency;
@@ -1558,15 +1716,33 @@ void CleanupChain::process (juce::AudioBuffer<float>& buffer)
     if (! bypass.compressor)
         comp.process (buffer);
 
-    // 7. de-ess AFTER compression, BEFORE the tone stage's additive HF
-    if (! bypass.deEss)
-        deEss.process (buffer);
-
-    // 8. tone match to the universal target curve, closed loop
+    // 7. tone match to the universal target curve, closed loop
     if (! bypass.toneMatch)
         tone.process (buffer);
 
-    // 9. safety limiter
+    // 8. de-ess AFTER the tone stage, not before it.
+    //
+    // The tone stage is where additive HF comes from -- on a dull source the
+    // loop lifts 12.5 kHz and 16 kHz by several dB -- and de-essing upstream of
+    // it means none of that addition is ever de-essed. Measured against the
+    // source, the chain was making the leading edge of a word 1.1 dB spikier
+    // above 5 kHz, and the tone stage on its own accounted for most of it.
+    //
+    // The loop still gets to see the result: its measurement is taken below,
+    // from the finished signal, so it keeps matching the target rather than
+    // matching its own output and letting the de-esser darken the result.
+    if (! bypass.deEss)
+        deEss.process (buffer);
+
+    // 9. take the edge off what the chain sharpened
+    if (! bypass.deEss)
+        softener.process (buffer);
+
+    // The loop matches the FINISHED signal, so it is measured last.
+    if (! bypass.toneMatch)
+        tone.observe (buffer);
+
+    // 10. safety limiter
     if (! bypass.limiter)
         limiter.process (buffer);
 }

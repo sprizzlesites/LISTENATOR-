@@ -108,6 +108,128 @@ float measureTailDb (const std::vector<float>& x, double sr, float noiseFloorDb)
     return ratios[ratios.size() / 2];
 }
 
+/** Lag, in samples, that best aligns `out` with `src`.
+
+    If this is not zero after compensating for the reported latency, the plugin
+    is lying to its host about its delay -- which every DAW would then get wrong
+    too, so it is worth knowing independently of any metric. */
+int measureAlignment (const std::vector<float>& src, const std::vector<float>& out,
+                      double sr, int searchSamples = 4096)
+{
+    const size_t start = (size_t) (25.0 * sr);
+    const size_t len   = (size_t) (4.0 * sr);
+    if (src.size() < start + len + (size_t) searchSamples
+        || out.size() < start + len + (size_t) searchSamples) return 0;
+
+    double best = -1.0; int bestLag = 0;
+    for (int lag = -searchSamples; lag <= searchSamples; ++lag)
+    {
+        double acc = 0.0;
+        for (size_t i = 0; i < len; i += 16)
+        {
+            const long j = (long) (start + i) + lag;
+            if (j < 0 || (size_t) j >= out.size()) continue;
+            acc += (double) src[start + i] * out[(size_t) j];
+        }
+        if (acc > best) { best = acc; bestLag = lag; }
+    }
+    return bestLag;
+}
+
+/** How far the leading edge of a word sticks out of the word.
+
+    A chain that rides gain can exaggerate onsets without touching the level or
+    the spectrum: if a stage sits at full boost through the gap and takes tens
+    of milliseconds to come back down, the first thing it lands on is the attack
+    transient. Plosives and sibilants are the loudest, fastest onsets a voice
+    makes, so they show it first.
+
+    The onset positions are found ONCE, on the source, and every signal is then
+    measured at those same instants. Detecting them separately per signal is not
+    an A/B at all -- each processed version qualifies a different set of words
+    and the medians are over different populations, which made a stage that
+    cannot touch onsets appear to reduce them by 3 dB. */
+std::vector<size_t> findOnsets (const std::vector<float>& x, double sr)
+{
+    const int frameLen = std::max (8, (int) (0.002 * sr));
+    std::vector<float> envDb;
+    for (size_t i = 0; i + (size_t) frameLen <= x.size(); i += (size_t) frameLen)
+    {
+        float pk = 0.0f;
+        for (int k = 0; k < frameLen; ++k) pk = std::max (pk, std::abs (x[i + (size_t) k]));
+        envDb.push_back (dbOf (pk));
+    }
+
+    const float frameSec = (float) frameLen / (float) sr;
+    const int quiet = std::max (2, (int) (0.060 / frameSec));
+    const int body  = std::max (6, (int) (0.150 / frameSec));
+
+    std::vector<size_t> out;
+    if (envDb.size() < 200) return out;
+
+    float prog = -60.0f;
+    for (size_t i = (size_t) quiet; i + (size_t) body < envDb.size(); ++i)
+    {
+        prog = std::max (envDb[i], prog - 0.02f);
+
+        float pre = -200.0f;
+        for (int k = 1; k <= quiet; ++k) pre = std::max (pre, envDb[i - (size_t) k]);
+        if (pre > prog - 12.0f) continue;            // not a gap
+        if (envDb[i] < pre + 10.0f) continue;        // not an onset
+        if (envDb[i] < prog - 15.0f) continue;       // too quiet to matter
+
+        out.push_back (i * (size_t) frameLen);
+        i += (size_t) body;
+    }
+    return out;
+}
+
+/** Peak of the first 15 ms against the body of the word, at given instants.
+    `loHz` > 0 restricts the measurement to a band, so the sibilant range can be
+    looked at on its own. Higher means spikier. */
+float onsetOvershootAt (const std::vector<float>& x, double sr,
+                        const std::vector<size_t>& onsets, float loHz = 0.0f)
+{
+    if (onsets.empty()) return 0.0f;
+
+    const float* src = x.data();
+    std::vector<float> filtered;
+    if (loHz > 0.0f)
+    {
+        filtered = x;
+        juce::dsp::LinkwitzRileyFilter<float> hp;
+        hp.prepare ({ sr, 512, 1 });
+        hp.setType (juce::dsp::LinkwitzRileyFilterType::highpass);
+        hp.setCutoffFrequency (loHz);
+        for (auto& v : filtered) v = hp.processSample (0, v);
+        src = filtered.data();
+    }
+
+    const int head  = (int) (0.015 * sr);
+    const int bodyA = (int) (0.025 * sr);
+    const int bodyB = (int) (0.150 * sr);
+
+    std::vector<float> overs;
+    for (size_t p : onsets)
+    {
+        if (p + (size_t) bodyB >= x.size()) continue;
+
+        float peak = 0.0f;
+        for (int k = 0; k < head; ++k) peak = std::max (peak, std::abs (src[p + (size_t) k]));
+
+        double acc = 0.0; int n = 0;
+        for (int k = bodyA; k <= bodyB; ++k) { acc += (double) src[p + (size_t) k] * src[p + (size_t) k]; ++n; }
+        if (n == 0 || peak <= 0.0f) continue;
+
+        const float bodyDb = 10.0f * (float) std::log10 (std::max (acc / n, 1e-20));
+        overs.push_back (dbOf (peak) - bodyDb);
+    }
+
+    if (overs.empty()) return 0.0f;
+    std::sort (overs.begin(), overs.end());
+    return overs[overs.size() / 2];
+}
+
 /** Envelope modulation depth at syllable rate (2-8 Hz).
 
     This is the measure that matters for "boxy". Reverberation fills the valleys
@@ -416,6 +538,8 @@ void dumpAnalysis (const AnalysisResult& a)
     std::printf ("  plosive   %.0f/%.0f Hz  depth %.1f dB  trip %.2f  (measured %.2f/s, worst ratio %.1f)\n",
                  a.plosiveCornerHz, a.plosiveUpperHz, a.plosiveDepthDb,
                  a.plosiveSensitivity, a.plosiveRate, a.plosivePeakRatio);
+    std::printf ("  onsets    measured overshoot %.1f dB  -> softener %.1f dB (trip %.1f)\n",
+                 a.onsetOvershootDb, a.transientDepthDb, a.transientThreshDb);
     std::printf ("  upward    ratio %.2f  thresh %.1f  floor %.1f  max boost %.1f dB  (ref seed %.1f)\n",
                  a.upwardRatio, a.upwardThresholdDb, a.upwardFloorDb,
                  a.upwardMaxBoostDb, a.upwardReferenceDb);
@@ -494,6 +618,23 @@ int main (int argc, char** argv)
     reportDynamics (dry, sr, "source");
     const float srcModulation = measureModulationDepth (dry, sr);
     const float srcMusicalNoise = measureMusicalNoise (dry, sr);
+    // Self-check: the alignment metric must report zero for a signal against
+    // itself, and exactly the shift for a known one. Otherwise every number it
+    // produces is an artefact of the measurement.
+    {
+        std::vector<float> shifted (dry.size(), 0.0f);
+        const int known = 300;
+        for (size_t i = (size_t) known; i < dry.size(); ++i) shifted[i] = dry[i - (size_t) known];
+        std::printf ("  [self-check] alignment(dry,dry) = %d (want 0), "
+                     "alignment(dry, dry delayed 300) = %d (want 300)\n",
+                     measureAlignment (dry, dry, sr), measureAlignment (dry, shifted, sr));
+    }
+
+    const auto onsets = findOnsets (dry, sr);
+    const float srcOnset  = onsetOvershootAt (dry, sr, onsets);
+    const float srcOnsetHf = onsetOvershootAt (dry, sr, onsets, 5000.0f);
+    std::printf ("  onset overshoot %.1f dB broadband, %.1f dB above 5 kHz  (%d onsets)\n",
+                 srcOnset, srcOnsetHf, (int) onsets.size());
     std::printf ("  musical noise %.1f dB rms frame-to-frame (lower = cleaner)\n", srcMusicalNoise);
     std::printf ("  modulation depth %.3f  (higher = drier)\n", srcModulation);
 
@@ -522,6 +663,7 @@ int main (int argc, char** argv)
         { "solo-declip",   pid::bpDeClip },   { "solo-plosive", pid::bpPlosive },
         { "solo-hpf",      pid::bpHighPass }, { "solo-denoise", pid::bpDeNoise  },
         { "solo-deverb",   pid::bpDeVerb },   { "solo-gate",    pid::bpGate     },
+        { "solo-upward",   pid::bpUpward },
         { "solo-surgical", pid::bpSurgical }, { "solo-resonance", pid::bpResonance },
         { "solo-comp",     pid::bpComp },     { "solo-deess",   pid::bpDeEss    },
         { "solo-tone",     pid::bpTone },     { "solo-limiter", pid::bpLimiter  },
@@ -571,10 +713,11 @@ int main (int argc, char** argv)
             if (lat > 0 && (int) o.size() > lat) o.erase (o.begin(), o.begin() + lat);
 
             auto st2 = measure (o, sr);
-            std::printf ("  %-16s rms %6.1f (src %.1f)  musicalNoise %5.1f (src %.1f)  mod %.3f\n",
-                         solo.name, st2.rmsDb, measure (dry, sr).rmsDb,
-                         measureMusicalNoise (o, sr), srcMusicalNoise,
-                         measureModulationDepth (o, sr));
+            std::printf ("  %-16s rms %6.1f  mod %.3f  onset %+.1f (src %.1f)  reportedLatency %5d  alignmentResidual %+d\n",
+                         solo.name, st2.rmsDb,
+                         measureModulationDepth (o, sr),
+                         onsetOvershootAt (o, sr, onsets), srcOnset,
+                         lat, measureAlignment (dry, o, sr));
         }
         std::printf ("\n");
     }
@@ -681,10 +824,15 @@ int main (int argc, char** argv)
             outR.erase (outR.begin(), outR.begin() + (long) cut);
         }
 
+        std::printf ("  alignment residual %d samples after removing the reported %d\n",
+                     measureAlignment (dry, outL, sr), latency);
         const float outTail = measureTailDb (outL, sr, p.getAnalysisResult().noiseFloorDb);
         const float outMod  = measureModulationDepth (outL, sr);
         std::printf ("  tail %.1f dB (src %.1f)   modulation depth %.3f (src %.3f)\n",
                      outTail, p.getAnalysisResult().tailDb, outMod, srcModulation);
+        std::printf ("  onset overshoot %.1f dB broadband (source %.1f), %.1f dB above 5 kHz (source %.1f)\n",
+                     onsetOvershootAt (outL, sr, onsets), srcOnset,
+                     onsetOvershootAt (outL, sr, onsets, 5000.0f), srcOnsetHf);
         std::printf ("  musical noise %.1f dB rms frame-to-frame (source %.1f)\n",
                      measureMusicalNoise (outL, sr), srcMusicalNoise);
         reportToneMatch (dry, outL, sr);
@@ -692,6 +840,7 @@ int main (int argc, char** argv)
         auto s = measure (outL, sr);
         std::printf ("  declipped %d samples   plosive guard max %.1f dB (LF transient ratio %.1f)\n",
                      p.getDeclippedCount(), worstPlosive, p.getPlosivePeakBoost());
+        std::printf ("  transient softener max %.1f dB\n", p.getTransientReductionDb());
         std::printf ("  live tone filter gains (dB):\n    ");
         for (int b = 0; b < numToneBands; ++b)
         {

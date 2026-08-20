@@ -337,6 +337,109 @@ void testToneMatchConverges()
                                     p.getToneUpdateCount(), p.getToneTrimDb()));
 }
 
+void testReportedLatencyIsTrue()
+{
+    std::printf ("\n[latency] the reported figure must be the real delay\n");
+
+    // Cross-correlation against a noise burst, not an impulse: a single sample
+    // gets gated away, and "centre of energy" is biased by however long the
+    // filters ring. The lag that best aligns input and output IS the delay.
+    auto delayOf = [] (const std::vector<float>& in, const std::vector<float>& out)
+    {
+        const size_t start = in.size() / 3, len = in.size() / 3;
+        const int search = 8192;
+        double best = -1.0e30; int bestLag = 0;
+        for (int lag = 0; lag <= search; ++lag)
+        {
+            double acc = 0.0;
+            for (size_t i = 0; i < len; i += 8)
+            {
+                const size_t j = start + i + (size_t) lag;
+                if (j >= out.size()) break;
+                acc += (double) in[start + i] * out[j];
+            }
+            if (acc > best) { best = acc; bestLag = lag; }
+        }
+        return bestLag;
+    };
+
+    juce::Random rng (31);
+    std::vector<float> noise ((size_t) (kSr * 6.0));
+    for (auto& v : noise) v = (rng.nextFloat() - 0.5f) * 0.5f;
+
+    struct Case { const char* name; std::vector<const char*> active; };
+    const std::vector<Case> cases {
+        { "no modules",  {} },
+        { "spectral",    { pid::bpDeNoise } },
+        { "limiter",     { pid::bpLimiter } },
+        { "everything",  { pid::bpDeClip, pid::bpPlosive, pid::bpHighPass, pid::bpDeNoise,
+                           pid::bpDeVerb, pid::bpGate, pid::bpUpward, pid::bpSurgical,
+                           pid::bpResonance, pid::bpDeEss, pid::bpComp, pid::bpTone,
+                           pid::bpLimiter } },
+    };
+    // The effects half is measured the same way: a host trusts one number for
+    // the whole plugin, so a delay hiding on that side is just as wrong.
+    struct FxCase { const char* name; std::vector<const char*> active; };
+    const std::vector<FxCase> fxCases {
+        { "fx: none",       {} },
+        { "fx: tuner",      { pid::bpAutoTune } },
+        { "fx: everything", { pid::bpAutoTune, pid::bpDoubler, pid::bpSaturation,
+                              pid::bpExciter, pid::bpCharacter, pid::bpWidth,
+                              pid::bpDelay, pid::bpReverb } },
+    };
+
+    for (const auto& c : cases)
+    {
+        ListenatorProcessor p;
+        p.prepareToPlay (kSr, kBlock);
+        doListen (p, makeVocal (16.0));
+
+        auto& st = p.getState();
+        for (auto* id : { pid::bpDeClip, pid::bpPlosive, pid::bpHighPass, pid::bpDeNoise,
+                          pid::bpDeVerb, pid::bpGate, pid::bpUpward, pid::bpSurgical,
+                          pid::bpResonance, pid::bpDeEss, pid::bpComp, pid::bpTone,
+                          pid::bpLimiter })
+            st.getParameter (id)->setValueNotifyingHost (1.0f);
+        for (auto* id : c.active)
+            st.getParameter (id)->setValueNotifyingHost (0.0f);
+        st.getParameter (pid::effectsBypass)->setValueNotifyingHost (1.0f);
+
+        auto out = runThrough (p, noise);
+        // read AFTER processing: parameter changes only reach the chain there,
+        // and with them the latency the chain would report to a host
+        const int reported = p.getLatencySamples();
+        const int actual   = delayOf (noise, out);
+
+        check (std::abs (actual - reported) <= 32,
+               juce::String ("reported latency is real: ") + c.name,
+               juce::String::formatted ("reported %d, measured %d", reported, actual));
+    }
+
+    for (const auto& c : fxCases)
+    {
+        ListenatorProcessor p;
+        p.prepareToPlay (kSr, kBlock);
+        doListen (p, makeVocal (16.0));
+
+        auto& st = p.getState();
+        st.getParameter (pid::cleanupBypass)->setValueNotifyingHost (1.0f);
+        for (auto* id : { pid::bpAutoTune, pid::bpDoubler, pid::bpSaturation, pid::bpExciter,
+                          pid::bpCharacter, pid::bpWidth, pid::bpDelay, pid::bpReverb })
+            st.getParameter (id)->setValueNotifyingHost (1.0f);
+        for (auto* id : c.active)
+            st.getParameter (id)->setValueNotifyingHost (0.0f);
+
+        auto out = runThrough (p, noise);
+        const int reported = p.getLatencySamples();
+        const int actual   = delayOf (noise, out);
+
+        check (std::abs (actual - reported) <= 32,
+               juce::String ("reported latency is real: ") + c.name,
+               juce::String::formatted ("reported %d, measured %d", reported, actual));
+    }
+}
+
+//==============================================================================
 void testDeverbRemovesAKnownRoom()
 {
     std::printf ("\n[de-verb] a known reverb must come back off\n");
@@ -846,6 +949,7 @@ int main()
     testAnalysisAccuracy();
     testSpectralEngineIsAudible();
     testToneMatchConverges();
+    testReportedLatencyIsTrue();
     testDeverbRemovesAKnownRoom();
     testUpwardExpanderLiftsQuietDelivery();
     testPlosiveGuardHitsThumpsNotNotes();

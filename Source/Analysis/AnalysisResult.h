@@ -119,6 +119,12 @@ struct AnalysisResult
     float plosiveRate        = 0.0f;    // measured events per second, diagnostic
     float plosivePeakRatio   = 0.0f;    // measured worst LF transient ratio
 
+    // Transient softener. Measured, because "the attacks are too strong" is a
+    // property of a particular recording and a particular chain, not a taste.
+    float onsetOvershootDb   = 0.0f;   // measured: leading 15 ms above the word
+    float transientThreshDb  = 4.0f;   // fast/slow excess that counts as an attack
+    float transientDepthDb   = 0.0f;   // negative, deepest softening
+
     float saturationDrive = 0.0f;   // 0..1 from measured dryness/dynamics
 
     std::vector<Resonance> resonances;              // surgical notches
