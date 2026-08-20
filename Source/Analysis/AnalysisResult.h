@@ -78,6 +78,7 @@ struct AnalysisResult
     float gateRangeDb     = -20.0f;
     float gateAttackMs    = 1.0f;
     float gateReleaseMs   = 120.0f;
+    float gateHoldMs      = 50.0f;   // bridges stops inside a word
 
     float denoiseAmount   = 0.0f;   // 0..1, scaled by measured SNR
     float deverbAmount    = 0.0f;   // 0..1, scaled by measured RT60

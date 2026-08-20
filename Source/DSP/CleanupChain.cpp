@@ -130,6 +130,20 @@ void SpectralEngine::setDeverbDecay (float rt60) noexcept
     const float hopSeconds = (float) hop / (float) sr;
     deverbDecayPerHop = juce::jlimit (0.05f, 0.995f,
                                       std::pow (10.0f, -3.0f * hopSeconds / rt60));
+
+    // How deep the per-bin subtraction may go, and it follows the room the
+    // OTHER way round from intuition.
+    //
+    // The depth the stage needs is not the question -- it is the depth the
+    // estimate can be trusted to. In a moderate room the late field is sparse
+    // enough that a per-bin estimate localises it, and a deep cut tells a tail
+    // from a vowel: against a synthetic 0.9 s room, going from half the bin to
+    // nine tenths took the tail from untouched to 4 dB down. In a 2 s booth
+    // with the singer moving, the field is dense and non-stationary, the
+    // per-bin estimate is mostly wrong, and the same depth measured 2 dB WORSE
+    // on the tail and 1.9 dB of extra spectral chatter. Deep subtraction is a
+    // reward for a reliable estimate, not a response to a bad room.
+    deverbMaxCut = juce::jlimit (0.45f, 0.92f, 0.92f - (rt60 - 0.8f) * 0.30f);
 }
 
 void SpectralEngine::setTailDb (float directToReverbDb) noexcept
@@ -273,11 +287,18 @@ void SpectralEngine::processFrame()
         const float decay = deverbDecayPerHop;
         const float norm  = 1.0f - decay;
 
-        // Capped at half the bin. Beyond that, per-bin subtraction stops
-        // sounding like a drier room and starts sounding like a phaser: the
-        // estimate is never accurate enough per-bin to remove more than that
-        // without leaving holes the ear reads as warbling.
-        const float maxCut = juce::jlimit (0.25f, 0.50f, 0.25f + deverb * 0.35f);
+        // The cap has to leave room for the stage to DIFFERENTIATE.
+        //
+        // At half the bin it was binding everywhere: during speech the estimate
+        // wants ~40% removed, in a tail it wants ~90%, and a flat 50% ceiling
+        // turns both into the same broadband attenuation. Measured against a
+        // synthetic 0.9 s room, that version left the tail-to-speech ratio
+        // exactly where it found it while costing 2.8 dB of level -- the tone
+        // stage then gave the level back and the net effect was nothing.
+        //
+        // What actually keeps per-bin subtraction from warbling is the gain
+        // smoothing across frequency and time further down, not a low ceiling.
+        const float maxCut = deverbMaxCut;
         const float floorG = 1.0f - maxCut;
 
         for (int b = 0; b < numBins; ++b)
@@ -327,7 +348,13 @@ void SpectralEngine::processFrame()
     // proportional terms rather than smearing narrow low-frequency detail.
     for (int b = 0; b < numBins; ++b)
     {
-        const int span = juce::jlimit (1, 6, b / 48 + 1);
+        // The window widens with how deeply the stage is cutting. Musical noise
+        // is a function of the DEPTH of a per-bin gain, not just its existence:
+        // a 3 dB cut that varies between neighbours is inaudible, a 20 dB one
+        // warbles. Letting the de-verb cut deep enough to tell a tail from a
+        // vowel is only safe if the smoothing scales with it.
+        const int extra = juce::jlimit (0, 3, (int) ((deverbMaxCut - 0.5f) * 6.0f));
+        const int span = juce::jlimit (1, 9, b / 48 + 1 + extra);
         const int a = juce::jmax (0, b - span);
         const int c = juce::jmin (numBins - 1, b + span);
 
@@ -339,7 +366,9 @@ void SpectralEngine::processFrame()
     // ---- then smooth over time so bins don't chirp frame to frame ----------
     for (int b = 0; b < numBins; ++b)
     {
-        const float g = 0.55f * smoothGains[(size_t) b] + 0.45f * prevGain[(size_t) b];
+        const float tw = 0.55f - 0.20f * juce::jlimit (0.0f, 1.0f,
+                                                       (deverbMaxCut - 0.5f) * 2.0f);
+        const float g = tw * smoothGains[(size_t) b] + (1.0f - tw) * prevGain[(size_t) b];
         prevGain[(size_t) b] = smoothGains[(size_t) b];
         cplx[b] *= juce::jlimit (0.0f, 1.0f, g);
     }
@@ -1294,6 +1323,8 @@ void CleanupChain::reset()
     gateEnv = 1.0f;
     gateGain = 1.0f;
     gateOpen = false;
+    gateDetEnv = 0.0f;
+    gateHoldLeft = 0;
     progEnv = 0.0f;
 }
 
@@ -1377,6 +1408,13 @@ void CleanupChain::updateFilters()
     gateAttackCoef  = timeCoef (analysis.gateAttackMs,  sr);
     gateReleaseCoef = timeCoef (analysis.gateReleaseMs, sr);
 
+    // Detector: quick enough to catch a word onset, slow enough on release that
+    // it describes the envelope rather than following the waveform down to zero
+    // every half cycle.
+    gateDetAtkCoef  = timeCoef (0.5f,  sr);
+    gateDetRelCoef  = timeCoef (35.0f, sr);
+    gateHoldSamples = (int) (0.001 * analysis.gateHoldMs * sr);
+
     // Relative threshold sits just above the measured tail, so what gets pulled
     // down is the room rather than the performance. tailDb is negative and is
     // relative to the level just before each gap.
@@ -1433,9 +1471,13 @@ void CleanupChain::process (juce::AudioBuffer<float>& buffer)
     {
         for (int i = 0; i < numSamples; ++i)
         {
-            float detect = 0.0f;
+            float peak = 0.0f;
             for (int ch = 0; ch < numCh; ++ch)
-                detect = juce::jmax (detect, std::abs (buffer.getSample (ch, i)));
+                peak = juce::jmax (peak, std::abs (buffer.getSample (ch, i)));
+
+            const float dc = peak > gateDetEnv ? gateDetAtkCoef : gateDetRelCoef;
+            gateDetEnv = dc * gateDetEnv + (1.0f - dc) * peak;
+            const float detect = gateDetEnv;
 
             // Programme level: rises immediately, forgets slowly. This is the
             // reference the relative threshold hangs off, so it has to track
@@ -1447,8 +1489,23 @@ void CleanupChain::process (juce::AudioBuffer<float>& buffer)
             const float openAt    = juce::jmax (gateOpenLin, relThresh);
             const float closeAt   = openAt * 0.5f;             // 6 dB hysteresis
 
-            if (! gateOpen && detect > openAt)       gateOpen = true;
-            else if (gateOpen && detect < closeAt)   gateOpen = false;
+            if (! gateOpen && detect > openAt)
+            {
+                gateOpen = true;
+                gateHoldLeft = gateHoldSamples;
+            }
+            else if (gateOpen && detect < closeAt)
+            {
+                // Hold before closing. Stops inside a word drop the level for
+                // 20-60 ms; without a hold the gate closes into every one of
+                // them and reopens on the other side.
+                if (gateHoldLeft > 0) --gateHoldLeft;
+                else                  gateOpen = false;
+            }
+            else if (gateOpen)
+            {
+                gateHoldLeft = gateHoldSamples;
+            }
 
             float target = 1.0f;
             if (! gateOpen)

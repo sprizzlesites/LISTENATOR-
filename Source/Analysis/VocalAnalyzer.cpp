@@ -1059,6 +1059,9 @@ void VocalAnalyzer::deriveSettings (AnalysisResult& r)
     // release much beyond that never acts before the next word arrives.
     // Long enough not to chatter, short enough to still reach into the gaps.
     r.gateReleaseMs = std::clamp (90.0f + r.reverbRatio * 60.0f, 90.0f, 150.0f);
+    // Long enough to bridge a stop consonant, short enough to still be inside
+    // the gap between words.
+    r.gateHoldMs    = std::clamp (r.gateReleaseMs * 0.45f, 30.0f, 80.0f);
 
     // ---- de-noise / de-verb: aggression scales with how bad the input is ----
     // Clean source -> near zero. Bad bedroom recording -> pushes hard.

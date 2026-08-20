@@ -115,6 +115,7 @@ private:
     int   samplesUntilFrame = hop;
     float denoise = 0.0f, deverb = 0.0f, resonanceDepth = 0.0f;
     float deverbDecayPerHop = 0.0f;
+    float deverbMaxCut = 0.5f;   // deepest per-bin subtraction, set from RT60
     float worstResonanceDb = 0.0f;
     int   resonanceBins = 0;
     int   minEnvSpanBins = 8;
@@ -524,6 +525,15 @@ private:
     float gateAttackCoef = 0.0f, gateReleaseCoef = 0.0f, gateRangeLin = 0.1f;
     float gateEnv = 1.0f;
     bool  gateOpen = false;
+
+    // The detector is an ENVELOPE, not the sample value. Comparing |x| against
+    // a threshold means the comparison flips twice per cycle of the
+    // fundamental, so near the threshold the gate opens and shuts at audio
+    // rate -- which is what made this stage the largest single source of
+    // frame-to-frame spectral instability in the whole chain.
+    float gateDetEnv = 0.0f, gateDetAtkCoef = 0.0f, gateDetRelCoef = 0.0f;
+    // ...and a hold, so a stop consonant inside a word cannot re-trigger it.
+    int   gateHoldSamples = 0, gateHoldLeft = 0;
     std::vector<float> gateTrace;   // per-sample gate gain, handed to the lift
 
     float progEnv = 0.0f, progReleaseCoef = 0.0f;

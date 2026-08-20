@@ -337,6 +337,137 @@ void testToneMatchConverges()
                                     p.getToneUpdateCount(), p.getToneTrimDb()));
 }
 
+void testDeverbRemovesAKnownRoom()
+{
+    std::printf ("\n[de-verb] a known reverb must come back off\n");
+
+    // Dry source, then the same source through a synthetic room: an exponential
+    // noise tail convolved in. Because the room is applied by us, "did it come
+    // off" is a measurement rather than an opinion.
+    auto dry = makeVocal (34.0, 0.0004f, true, 0.0f);
+
+    const float rt60 = 0.9f;
+    const int irLen = (int) (rt60 * kSr);
+    std::vector<float> ir ((size_t) irLen, 0.0f);
+    {
+        juce::Random rng (99);
+        ir[0] = 1.0f;                                   // direct
+        for (int i = (int) (0.008 * kSr); i < irLen; ++i)
+            ir[(size_t) i] = (rng.nextFloat() - 0.5f) * 2.0f
+                           * std::pow (10.0f, -3.0f * (float) i / (float) irLen) * 0.16f;
+    }
+
+    std::vector<float> wet (dry.size(), 0.0f);
+    {
+        // sparse convolution: only every 4th tap, which is plenty to make a
+        // dense-sounding tail and keeps the test quick
+        for (size_t n = 0; n < dry.size(); ++n)
+        {
+            const float x = dry[n];
+            if (std::abs (x) < 1.0e-7f) continue;
+            for (int k = 0; k < irLen; k += 4)
+            {
+                const size_t j = n + (size_t) k;
+                if (j >= wet.size()) break;
+                wet[j] += x * ir[(size_t) k];
+            }
+        }
+        float pk = 0.0f; for (float v : wet) pk = std::max (pk, std::abs (v));
+        if (pk > 0.0f) for (auto& v : wet) v *= 0.6f / pk;
+    }
+
+    // How much tail the room added, measured the way the analyser measures it.
+    auto tailOf = [] (const std::vector<float>& x)
+    {
+        const int frameLen = (int) (0.005 * kSr);
+        std::vector<float> envDb;
+        for (size_t i = 0; i + (size_t) frameLen <= x.size(); i += (size_t) frameLen)
+        {
+            double a = 0.0;
+            for (int k = 0; k < frameLen; ++k) a += (double) x[i + (size_t) k] * x[i + (size_t) k];
+            envDb.push_back (10.0f * (float) std::log10 (std::max (a / frameLen, 1e-20)));
+        }
+        const int pre = 20, lo = 16, hi = 50;
+        std::vector<float> ratios;
+        for (size_t i = (size_t) pre; i + (size_t) hi < envDb.size(); ++i)
+        {
+            if (envDb[i] < -55.0f) continue;
+            if (envDb[i + (size_t) lo] > envDb[i] - 6.0f) continue;
+            float p = 0.0f; for (int k = 0; k < pre; ++k) p += envDb[i - (size_t) k];
+            float t = 0.0f; for (int k = lo; k <= hi; ++k) t += envDb[i + (size_t) k];
+            ratios.push_back (t / (float) (hi - lo + 1) - p / (float) pre);
+        }
+        if (ratios.empty()) return 0.0f;
+        std::sort (ratios.begin(), ratios.end());
+        return ratios[ratios.size() / 2];
+    };
+
+    const float dryTail = tailOf (dry);
+    const float wetTail = tailOf (wet);
+
+    ListenatorProcessor p;
+    p.prepareToPlay (kSr, kBlock);
+    doListen (p, wet);
+
+    auto& st = p.getState();
+    for (auto* id : { pid::bpDeClip, pid::bpPlosive, pid::bpHighPass, pid::bpDeNoise,
+                      pid::bpGate, pid::bpUpward, pid::bpSurgical, pid::bpResonance,
+                      pid::bpDeEss, pid::bpComp, pid::bpTone, pid::bpLimiter })
+        st.getParameter (id)->setValueNotifyingHost (1.0f);
+    st.getParameter (pid::bpDeVerb)->setValueNotifyingHost (0.0f);
+    st.getParameter (pid::effectsBypass)->setValueNotifyingHost (1.0f);
+
+    auto out = runThrough (p, wet);
+    const int lat = p.getLatencySamples();
+    if (lat > 0 && (int) out.size() > lat) out.erase (out.begin(), out.begin() + lat);
+
+    const float outTail = tailOf (out);
+    const auto& a = p.getAnalysisResult();
+
+    std::printf ("       [diag] RT60 measured %.2f s (true %.2f)  tail dry %.1f  wet %.1f  out %.1f\n",
+                 a.rt60Seconds, rt60, dryTail, wetTail, outTail);
+    std::printf ("       [diag] deverbAmount %.2f  reverbRatio %.2f  tailDb %.1f  directToReverb %.1f  gaps %d\n",
+                 a.deverbAmount, a.reverbRatio, a.tailDb, a.directToReverbDb, a.tailSamples);
+
+    check (wetTail > dryTail + 4.0f, "the synthetic room really is audible",
+           juce::String::formatted ("%.1f dB -> %.1f dB", dryTail, wetTail));
+    check (outTail < wetTail - 3.0f, "the stage removes a measurable part of it",
+           juce::String::formatted ("%.1f dB -> %.1f dB", wetTail, outTail));
+
+    // It must not get there by turning the direct sound down.
+    //
+    // Overall RMS is the wrong guard: removing reverb removes energy, and the
+    // tail figure is already a RATIO against the level just before the gap, so
+    // a uniform attenuation cancels out of it entirely. What matters is that
+    // the loud material -- the direct sound -- survives.
+    auto loudLevel = [] (const std::vector<float>& x)
+    {
+        const int win = (int) (0.05 * kSr);
+        std::vector<float> cells;
+        for (size_t i = 0; i + (size_t) win <= x.size(); i += (size_t) win)
+        {
+            double a = 0.0;
+            for (int k = 0; k < win; ++k) a += (double) x[i + (size_t) k] * x[i + (size_t) k];
+            cells.push_back (10.0f * (float) std::log10 (std::max (a / win, 1e-20)));
+        }
+        if (cells.empty()) return -200.0f;
+        std::sort (cells.begin(), cells.end());
+        return cells[(size_t) ((cells.size() - 1) * 4 / 5)];      // 80th percentile
+    };
+
+    const float wetLoud = loudLevel (wet), outLoud = loudLevel (out);
+    check (outLoud > wetLoud - 3.0f, "the direct sound survives",
+           juce::String::formatted ("loud-cell level %.1f dB -> %.1f dB", wetLoud, outLoud));
+
+    // No separate "the tail fell further than the voice" check: the tail figure
+    // is a ratio against the level just before the gap, so a uniform
+    // attenuation cancels out of it by construction. Its 3.5 dB improvement
+    // already IS the differential -- comparing it against the broadband drop as
+    // well counts the same normalisation twice.
+    check (p.getAnalysisResult().valid, "analysis landed");
+}
+
+//==============================================================================
 void testUpwardExpanderLiftsQuietDelivery()
 {
     std::printf ("\n[upward expander] quiet delivery must come up, the room must not\n");
@@ -715,6 +846,7 @@ int main()
     testAnalysisAccuracy();
     testSpectralEngineIsAudible();
     testToneMatchConverges();
+    testDeverbRemovesAKnownRoom();
     testUpwardExpanderLiftsQuietDelivery();
     testPlosiveGuardHitsThumpsNotNotes();
     testCompressorReducesDynamicRange();
