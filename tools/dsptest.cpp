@@ -234,74 +234,287 @@ void testNoRunawayOrNaN()
            juce::String::formatted ("peak %.4f", pk));
 }
 
-void testToneMatchCurveIsApplied()
+void testToneMatchConverges()
 {
-    std::printf ("\n[tone match] applied EQ must track the intended curve\n");
+    std::printf ("\n[tone match] the loop must converge on the target curve\n");
 
-    // A deliberately dull source: the tone stage should lift its top end.
+    // The stage is a closed loop, so the property worth testing is not "the
+    // filters match the curve the analysis asked for" -- that curve is only a
+    // starting guess. It is "whatever goes in, the spectrum that comes out
+    // approaches the target". Feeding it a source whose shape is nothing like
+    // the target is the strongest version of that test.
     ListenatorProcessor p;
     p.prepareToPlay (kSr, kBlock);
     doListen (p, makeVocal (16.0));
-    const auto intended = p.getAnalysisResult().toneMatchDb;
 
-    // Isolate the tone stage: everything else off.
     auto& st = p.getState();
     for (auto* id : { pid::bpHighPass, pid::bpDeNoise, pid::bpDeVerb, pid::bpGate,
-                      pid::bpSurgical, pid::bpResonance, pid::bpDeEss, pid::bpComp,
-                      pid::bpLimiter })
+                      pid::bpUpward, pid::bpSurgical, pid::bpResonance, pid::bpDeEss,
+                      pid::bpComp, pid::bpLimiter, pid::bpDeClip, pid::bpPlosive })
         st.getParameter (id)->setValueNotifyingHost (1.0f);
     st.getParameter (pid::bpTone)->setValueNotifyingHost (0.0f);
     st.getParameter (pid::effectsBypass)->setValueNotifyingHost (1.0f);
 
-    // White noise in, so the measured difference IS the filter response.
+    // Flat noise: every band is wrong by the full depth of the target curve.
     juce::Random rng (11);
-    std::vector<float> noise ((size_t) (kSr * 12.0));
+    std::vector<float> noise ((size_t) (kSr * 45.0));
     for (auto& v : noise) v = (rng.nextFloat() - 0.5f) * 0.4f;
 
     auto out = runThrough (p, noise);
-    const size_t skip = (size_t) kSr;      // let filters settle
-    std::vector<float> inTail (noise.begin() + (long) skip, noise.end());
-    std::vector<float> outTail (out.begin() + (long) skip, out.end());
 
-    auto sIn  = spectrumDb (inTail);
-    auto sOut = spectrumDb (outTail);
+    // Only the last third: the loop is deliberately slow, and measuring while
+    // it is still converging tests the ramp rather than the destination.
+    const size_t tail = out.size() * 2 / 3;
+    std::vector<float> settled (out.begin() + (long) tail, out.end());
+    std::vector<float> before (noise.begin() + (long) tail, noise.end());
 
-    // Compare at each 1/3-octave centre against what the analysis asked for.
-    float worstErr = 0.0f;
-    juce::String worstAt;
-    int compared = 0;
-
-    for (int b = 0; b < numToneBands; ++b)
+    auto bandsOf = [] (const std::vector<float>& x)
     {
-        const float f = toneBandHz[(size_t) b];
-        if (f < 100.0f || f > 12000.0f) continue;
-
-        // Average across a 1/6-octave window in LOG space: a fixed +/-2 bins is
-        // far too narrow at 200 Hz and far too wide at 10 kHz.
+        auto sp = spectrumDb (x);
         const int fftLen = 1 << 14;
-        const int b0 = (int) std::round (f / std::pow (2.0f, 1.0f / 12.0f) * fftLen / kSr);
-        const int b1 = (int) std::round (f * std::pow (2.0f, 1.0f / 12.0f) * fftLen / kSr);
-        if (b0 < 2 || b1 >= (int) sIn.size() - 1 || b1 <= b0) continue;
+        std::array<float, numToneBands> b {};
+        for (int i = 0; i < numToneBands; ++i)
+        {
+            const float f = toneBandHz[(size_t) i];
+            const int lo = (int) std::round (f / 1.122462f * fftLen / kSr);
+            const int hi = (int) std::round (f * 1.122462f * fftLen / kSr);
+            float acc = 0.0f; int cnt = 0;
+            for (int k = std::max (1, lo); k <= std::min (hi, (int) sp.size() - 1); ++k)
+            { acc += sp[(size_t) k]; ++cnt; }
+            b[(size_t) i] = cnt > 0 ? acc / (float) cnt : -200.0f;
+        }
+        // normalise on the 200 Hz-2 kHz average, as the target curve is
+        float ref = 0.0f; int n = 0;
+        for (int i = 0; i < numToneBands; ++i)
+        {
+            const float f = toneBandHz[(size_t) i];
+            if (f < 200.0f || f > 2000.0f) continue;
+            ref += b[(size_t) i]; ++n;
+        }
+        if (n > 0) { ref /= (float) n; for (auto& v : b) v -= ref; }
+        return b;
+    };
 
-        float di = 0.0f, doo = 0.0f; int cnt = 0;
-        for (int k = b0; k <= b1; ++k)
-        { di += sIn[(size_t) k]; doo += sOut[(size_t) k]; ++cnt; }
-        const float measured = (doo - di) / (float) cnt;
-        const float want = intended[(size_t) b];
-
-        const float err = std::abs (measured - want);
-        if (err > worstErr) { worstErr = err; worstAt = juce::String ((int) f) + " Hz"; }
-        ++compared;
+    auto tgt = kTargetLtasDb;
+    {
+        float ref = 0.0f; int n = 0;
+        for (int i = 0; i < numToneBands; ++i)
+        {
+            const float f = toneBandHz[(size_t) i];
+            if (f < 200.0f || f > 2000.0f) continue;
+            ref += tgt[(size_t) i]; ++n;
+        }
+        if (n > 0) for (auto& v : tgt) v -= ref / (float) n;
     }
 
-    check (compared > 10, "enough bands compared", juce::String (compared));
+    const auto inB = bandsOf (before);
+    const auto outB = bandsOf (settled);
 
-    // The old Q=1.6 stacking made this error many dB. Narrow filters at the
-    // correct 1/3-octave Q should track the intended curve closely.
-    check (worstErr < 3.0f, "applied curve tracks intended within 3 dB",
-           juce::String::formatted ("worst %.2f dB at %s", worstErr, worstAt.toRawUTF8()));
+    float errIn = 0.0f, errOut = 0.0f, worst = 0.0f; int cnt = 0;
+    juce::String worstAt;
+    for (int i = 0; i < numToneBands; ++i)
+    {
+        const float f = toneBandHz[(size_t) i];
+        // 125 Hz-6.3 kHz: outside it, flat noise needs more than the deliberate
+        // +/-12 dB filter bound to reach the target, so the clamp is the answer.
+        if (f < 125.0f || f > 6300.0f) continue;
+        const float eo = std::abs (outB[(size_t) i] - tgt[(size_t) i]);
+        errIn  += std::abs (inB[(size_t) i] - tgt[(size_t) i]);
+        errOut += eo;
+        if (eo > worst) { worst = eo; worstAt = juce::String ((int) f) + " Hz"; }
+        ++cnt;
+    }
+    errIn /= (float) std::max (1, cnt);
+    errOut /= (float) std::max (1, cnt);
+
+    check (cnt > 10, "enough bands compared", juce::String (cnt));
+    check (errOut < errIn * 0.5f, "loop moves the spectrum toward the target",
+           juce::String::formatted ("mean |error| %.2f dB in, %.2f dB out", errIn, errOut));
+    check (worst < 4.0f, "no band left badly wrong",
+           juce::String::formatted ("worst %.2f dB at %s", worst, worstAt.toRawUTF8()));
+    check (p.getToneUpdateCount() > 10, "loop actually ran",
+           juce::String::formatted ("%d updates, max trim %.1f dB",
+                                    p.getToneUpdateCount(), p.getToneTrimDb()));
 }
 
+void testUpwardExpanderLiftsQuietDelivery()
+{
+    std::printf ("\n[upward expander] quiet delivery must come up, the room must not\n");
+
+    // Alternating loud and quiet phrases over a constant noise floor. The stage
+    // has to close the gap between the phrases without lifting the floor.
+    const float floorAmp = 0.0016f;
+    const int n = (int) (36.0 * kSr);
+    std::vector<float> material ((size_t) n);
+    {
+        juce::Random rng (23);
+        double phase = 0.0;
+        for (int i = 0; i < n; ++i)
+        {
+            const double t = (double) i / kSr;
+            phase += 2.0 * juce::MathConstants<double>::pi * 196.0 / kSr;
+            float sig = 0.0f;
+            for (int h = 1; h <= 20; ++h) sig += (float) (std::sin (phase * h) / (h * h));
+
+            // 1.2 s of phrase, 0.6 s of gap; every other phrase 10 dB down
+            const bool inPhrase = std::fmod (t, 1.8) < 1.2;
+            const bool quietOne = std::fmod (t, 3.6) >= 1.8;
+            const float amp = inPhrase ? (quietOne ? 0.34f * 0.316f : 0.34f) : 0.0f;
+            material[(size_t) i] = sig * amp + (rng.nextFloat() - 0.5f) * 2.0f * floorAmp;
+        }
+    }
+
+    auto window = [] (const std::vector<float>& x, double from, double to)
+    {
+        const size_t a = (size_t) (from * kSr);
+        const size_t b = std::min ((size_t) (to * kSr), x.size());
+        if (a >= b) return 1.0e-20;
+        double acc = 0.0;
+        for (size_t i = a; i < b; ++i) acc += (double) x[i] * x[i];
+        return std::max (acc / (double) (b - a), 1.0e-20);
+    };
+
+    // Average the loud phrases, the quiet phrases and the gaps separately.
+    auto phraseStats = [&] (const std::vector<float>& x, float& loud, float& quiet, float& gap)
+    {
+        double l = 0.0, q = 0.0, g = 0.0; int cnt = 0;
+        for (double t = 3.6; t + 3.6 < (double) x.size() / kSr; t += 3.6)
+        {
+            l += window (x, t + 0.3,  t + 1.1);
+            q += window (x, t + 2.1,  t + 2.9);
+            g += window (x, t + 1.35, t + 1.75);
+            ++cnt;
+        }
+        cnt = std::max (1, cnt);
+        loud  = 10.0f * (float) std::log10 (l / cnt);
+        quiet = 10.0f * (float) std::log10 (q / cnt);
+        gap   = 10.0f * (float) std::log10 (g / cnt);
+    };
+
+    float srcLoud = 0, srcQuiet = 0, srcGap = 0;
+    phraseStats (material, srcLoud, srcQuiet, srcGap);
+
+    ListenatorProcessor p;
+    p.prepareToPlay (kSr, kBlock);
+    doListen (p, material);
+
+    // Isolate: only the upward expander, so the compressors cannot be credited
+    // with what this stage does.
+    auto& st = p.getState();
+    for (auto* id : { pid::bpDeClip, pid::bpPlosive, pid::bpHighPass, pid::bpDeNoise,
+                      pid::bpDeVerb, pid::bpGate, pid::bpSurgical, pid::bpResonance,
+                      pid::bpDeEss, pid::bpComp, pid::bpTone, pid::bpLimiter })
+        st.getParameter (id)->setValueNotifyingHost (1.0f);
+    st.getParameter (pid::bpUpward)->setValueNotifyingHost (0.0f);
+    st.getParameter (pid::effectsBypass)->setValueNotifyingHost (1.0f);
+
+    auto out = runThrough (p, material);
+    const int lat = p.getLatencySamples();
+    if (lat > 0 && (int) out.size() > lat) out.erase (out.begin(), out.begin() + lat);
+
+    float outLoud = 0, outQuiet = 0, outGap = 0;
+    phraseStats (out, outLoud, outQuiet, outGap);
+
+    const float srcSpread = srcLoud - srcQuiet;
+    const float outSpread = outLoud - outQuiet;
+
+    check (outSpread < srcSpread - 1.0f, "quiet phrases come closer to the loud ones",
+           juce::String::formatted ("spread %.1f dB -> %.1f dB", srcSpread, outSpread));
+    check (outQuiet > srcQuiet + 0.8f, "the lift lands on the quiet phrase",
+           juce::String::formatted ("%.1f dB -> %.1f dB", srcQuiet, outQuiet));
+    check (outLoud < srcLoud + 0.6f, "the loud phrase is left alone",
+           juce::String::formatted ("%.1f dB -> %.1f dB", srcLoud, outLoud));
+    check (outGap < srcGap + 1.0f, "the noise floor between phrases is not lifted",
+           juce::String::formatted ("%.1f dB -> %.1f dB", srcGap, outGap));
+}
+
+//==============================================================================
+void testPlosiveGuardHitsThumpsNotNotes()
+{
+    std::printf ("\n[plosive guard] pops must duck, low notes must not\n");
+
+    // Two things a naive low-band detector cannot tell apart: a 70 Hz burst
+    // with no high-frequency content, and the onset of a sung note whose
+    // fundamental lives in the same region.
+    const int n = (int) (30.0 * kSr);
+    std::vector<float> material ((size_t) n);
+    std::vector<char> isPop ((size_t) n, 0), isNote ((size_t) n, 0);
+    {
+        juce::Random rng (5);
+        double phase = 0.0, popPhase = 0.0;
+        for (int i = 0; i < n; ++i)
+        {
+            const double t = (double) i / kSr;
+            phase    += 2.0 * juce::MathConstants<double>::pi * 130.0 / kSr;
+            popPhase += 2.0 * juce::MathConstants<double>::pi * 70.0  / kSr;
+
+            float sig = 0.0f;
+            for (int h = 1; h <= 20; ++h) sig += (float) (std::sin (phase * h) / (h * h));
+
+            const double cyc = std::fmod (t, 2.0);
+            float v = 0.0f;
+
+            if (cyc < 0.9)                                  // sung note
+            {
+                v = sig * 0.34f * (float) std::min (1.0, cyc / 0.008);
+                if (cyc > 0.02 && cyc < 0.85) isNote[(size_t) i] = 1;
+            }
+            else if (cyc > 1.2 && cyc < 1.30)               // pop: low, no HF
+            {
+                v = (float) std::sin (popPhase) * 0.55f
+                  * (float) std::exp (-(cyc - 1.2) * 45.0);
+                isPop[(size_t) i] = 1;
+            }
+
+            material[(size_t) i] = v + (rng.nextFloat() - 0.5f) * 0.0016f;
+        }
+    }
+
+    auto energy = [] (const std::vector<float>& x, const std::vector<char>& mask)
+    {
+        double acc = 0.0; size_t cnt = 0;
+        for (size_t i = 0; i < x.size() && i < mask.size(); ++i)
+            if (mask[i] != 0) { acc += (double) x[i] * x[i]; ++cnt; }
+        return 10.0f * (float) std::log10 (std::max (acc / (double) std::max<size_t> (1, cnt), 1e-20));
+    };
+
+    ListenatorProcessor p;
+    p.prepareToPlay (kSr, kBlock);
+    doListen (p, material);
+
+    auto& st = p.getState();
+    for (auto* id : { pid::bpDeClip, pid::bpHighPass, pid::bpDeNoise, pid::bpDeVerb,
+                      pid::bpGate, pid::bpUpward, pid::bpSurgical, pid::bpResonance,
+                      pid::bpDeEss, pid::bpComp, pid::bpTone, pid::bpLimiter })
+        st.getParameter (id)->setValueNotifyingHost (1.0f);
+    st.getParameter (pid::bpPlosive)->setValueNotifyingHost (0.0f);
+    st.getParameter (pid::effectsBypass)->setValueNotifyingHost (1.0f);
+
+    auto out = runThrough (p, material);
+    const int lat = p.getLatencySamples();
+    if (lat > 0 && (int) out.size() > lat) out.erase (out.begin(), out.begin() + lat);
+
+    const float popIn  = energy (material, isPop),  popOut  = energy (out, isPop);
+    const float noteIn = energy (material, isNote), noteOut = energy (out, isNote);
+    const auto& a = p.getAnalysisResult();
+
+    std::printf ("       [diag] bands %.0f/%.0f Hz  depth %.1f dB  trip %.2f  "
+                 "measured %.2f/s worst %.1f  guard max %.1f dB\n",
+                 a.plosiveCornerHz, a.plosiveUpperHz, a.plosiveDepthDb,
+                 a.plosiveSensitivity, a.plosiveRate, a.plosivePeakRatio,
+                 p.getPlosiveReductionDb());
+
+    check (popOut < popIn - 3.0f, "the pop is ducked",
+           juce::String::formatted ("%.1f dB -> %.1f dB", popIn, popOut));
+    check (noteOut > noteIn - 1.0f, "the sung note is not",
+           juce::String::formatted ("%.1f dB -> %.1f dB", noteIn, noteOut));
+    check (a.plosiveCornerHz > a.highPassHz,
+           "the guard's band sits above the high-pass",
+           juce::String::formatted ("corner %.0f Hz vs hpf %.0f Hz",
+                                    a.plosiveCornerHz, a.highPassHz));
+}
+
+//==============================================================================
 void testCompressorReducesDynamicRange()
 {
     std::printf ("\n[compressor] must reduce range, not crush everything\n");
@@ -354,6 +567,7 @@ void testDeEsserActsOnSibilanceOnly()
 
     auto& st = p.getState();
     for (auto* id : { pid::bpHighPass, pid::bpDeNoise, pid::bpDeVerb, pid::bpGate,
+                      pid::bpUpward, pid::bpDeClip, pid::bpPlosive,
                       pid::bpSurgical, pid::bpResonance, pid::bpComp, pid::bpTone,
                       pid::bpLimiter })
         st.getParameter (id)->setValueNotifyingHost (1.0f);
@@ -500,7 +714,9 @@ int main()
     testColdStartIsTransparent();
     testAnalysisAccuracy();
     testSpectralEngineIsAudible();
-    testToneMatchCurveIsApplied();
+    testToneMatchConverges();
+    testUpwardExpanderLiftsQuietDelivery();
+    testPlosiveGuardHitsThumpsNotNotes();
     testCompressorReducesDynamicRange();
     testDeEsserActsOnSibilanceOnly();
     testTrimKnobsHaveEffect();

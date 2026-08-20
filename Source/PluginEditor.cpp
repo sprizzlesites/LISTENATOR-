@@ -117,6 +117,7 @@ void ListenatorEditor::buildRack()
     addModule (cleanupModules, pid::bpDeNoise,   "DE-NOISE",     mintGreen);
     addModule (cleanupModules, pid::bpDeVerb,    "DE-VERB",      mintGreen);
     addModule (cleanupModules, pid::bpGate,      "GATE",         mintGreen);
+    addModule (cleanupModules, pid::bpUpward,    "UP-EXPANDER",  mintGreen);
     addModule (cleanupModules, pid::bpSurgical,  "SURGICAL EQ",  mintGreen);
     addModule (cleanupModules, pid::bpResonance, "RESONANCE",    mintGreen);
     addModule (cleanupModules, pid::bpComp,      "COMPRESSOR",   mintGreen);

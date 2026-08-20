@@ -11,6 +11,7 @@ struct CleanupBypass
 {
     bool deClip = false, plosive = false;
     bool highPass = false, deNoise = false, deVerb = false, gate = false;
+    bool upward = false;
     bool surgicalEq = false, resonance = false, deEss = false;
     bool compressor = false, toneMatch = false, limiter = false;
 
@@ -18,7 +19,8 @@ struct CleanupBypass
     {
         return deClip == o.deClip && plosive == o.plosive
             && highPass == o.highPass && deNoise == o.deNoise && deVerb == o.deVerb
-            && gate == o.gate && surgicalEq == o.surgicalEq && resonance == o.resonance
+            && gate == o.gate && upward == o.upward
+            && surgicalEq == o.surgicalEq && resonance == o.resonance
             && deEss == o.deEss && compressor == o.compressor && toneMatch == o.toneMatch
             && limiter == o.limiter;
     }
@@ -203,28 +205,107 @@ public:
     void prepare (double sampleRate, int maxBlockSize, int numChannels);
     void reset();
     void setAmount (float a) noexcept { amount = juce::jlimit (0.0f, 1.0f, a); }
-    void setCornerHz (float hz) noexcept;
+    void setParams (const AnalysisResult&) noexcept;
+    /** Bands only; used by the analyser's measurement pass and by the tests. */
+    void setBands (float cornerHz, float upperHz) noexcept;
 
     void process (juce::AudioBuffer<float>&);
 
     float getReductionDb() const noexcept { return lastReductionDb; }
     float getPeakBoost()   const noexcept { return peakLfBoost; }
 
+    /** The transient detector, exposed so the analyser can run the identical
+        thing over the capture instead of guessing how sensitive the guard
+        should be.
+
+        What identifies a pop is not that the low band jumped -- a sung note
+        does that too -- but that it jumped and the band above it did NOT. How
+        far a pop stands above the background depends entirely on how loud the
+        singer was a moment earlier, so keying depth off that figure makes the
+        guard's strength a function of the arrangement. The low-to-high contrast
+        does not have that problem. */
+    struct Detector
+    {
+        struct Result { float lfBoost, hfBoost, contrast; };
+
+        void prepare (double sr) noexcept;
+        void reset() noexcept;
+        Result push (float lo, float hi) noexcept;
+
+        float lfFast = 0.0f, lfSlow = 0.0f, hfFast = 0.0f, hfSlow = 0.0f;
+        float fastAtk = 0.0f, fastRel = 0.0f, slowAtk = 0.0f, slowRel = 0.0f;
+    };
+
 private:
     double sr = 44100.0;
-    juce::dsp::LinkwitzRileyFilter<float> lowBand, highBand;
-    juce::AudioBuffer<float> lowBuf, highBuf;
+    // Two crossovers, three bands. A single split ducks either too little (the
+    // corner sits under the high-pass, so the guard removes what was leaving
+    // anyway) or too much (a full cut through the fundamental thins every word
+    // that starts with a consonant).
+    juce::dsp::LinkwitzRileyFilter<float> splitLow, splitLowHi, splitUp, splitUpHi;
+    // The sub band never passes through the SECOND crossover, so its phase no
+    // longer matches the two bands that did, and summing the three notches the
+    // low-mids even with every gain at unity -- measured at 2.5 dB on a sung
+    // note. An allpass at the upper corner puts the phases back together.
+    juce::dsp::LinkwitzRileyFilter<float> subAllpass;
+    juce::AudioBuffer<float> subBuf, midBuf, topBuf;
 
     float amount = 1.0f;
-    // Fast/slow envelope pairs per band. A plosive is a burst that is fast in
-    // the low band and NOT matched in the high band; comparing steady levels
-    // instead fails whenever the fundamental sits near the crossover, which for
-    // a low male voice it always does.
-    float lfFast = 0.0f, lfSlow = 0.0f, hfFast = 0.0f, hfSlow = 0.0f;
-    float fastCoef = 0.0f, slowCoef = 0.0f;
+    float depthLin = 0.2f;      // deepest duck for the sub band
+    float sensitivity = 2.0f;   // LF transient ratio that counts as a pop
+
+    Detector detector;
     float gain = 1.0f, attackCoef = 0.0f, releaseCoef = 0.0f;
+    int   holdSamples = 0, holdLeft = 0;
     float lastReductionDb = 0.0f;
     float peakLfBoost = 0.0f;
+};
+
+//==============================================================================
+/** Upward expander: lifts quiet delivery toward the take average.
+
+    Downward compression can only bring the loud parts down to meet the quiet
+    ones. Past a certain amount that is exactly what makes a vocal sound choppy
+    -- the loud syllables get flattened while the quiet ones stay where they
+    were, so the ear hears the processing rather than the performance. Raising
+    the floor instead gets to the same consistency for less gain reduction.
+
+    Everything is relative to a running programme level rather than absolute,
+    because the whole problem on a punch-in recording is that "quiet" means
+    different things in different takes. The threshold, the floor below which
+    the lift tapers off (so room tone and hiss are never lifted) and the maximum
+    boost all hang off that follower.
+*/
+class UpwardExpander
+{
+public:
+    void prepare (double sampleRate, int numChannels);
+    void reset();
+    void setParams (const AnalysisResult&, float amount);
+    /** @param gateWeight  per-sample gate gain, 0..1. The lift is scaled by it so
+                           the stage never puts back what the downward expander
+                           just took out -- their working ranges overlap, and
+                           left independent they spend most of a syllable decay
+                           pulling against each other. Null means "wide open". */
+    void process (juce::AudioBuffer<float>&, const float* gateWeight);
+
+    float getBoostDb()    const noexcept { return lastBoostDb; }
+    float getMaxBoostDb() const noexcept { return peakBoostDb; }
+
+private:
+    double sr = 44100.0;
+    float envSq = 0.0f, envAtkCoef = 0.0f, envRelCoef = 0.0f;
+    float refLin = 0.0f, refCoef = 0.0f, seedLin = 0.0f;
+    float gain = 1.0f, gainAtkCoef = 0.0f, gainRelCoef = 0.0f;
+
+    float thresholdOffsetDb = -4.0f;
+    float floorOffsetDb     = -12.0f;
+    float fadeDb            = 6.0f;
+    float slope             = 0.375f;   // 1 - 1/ratio
+    float maxBoostDb        = 6.0f;
+    float amount            = 1.0f;
+
+    float lastBoostDb = 0.0f, peakBoostDb = 0.0f;
 };
 
 //==============================================================================
@@ -255,6 +336,80 @@ private:
 };
 
 //==============================================================================
+/** Tone matching as a closed loop rather than an open one.
+
+    The static curve solved by the LISTEN pass is only ever a starting point.
+    Two things make an open-loop curve wrong in practice:
+
+      - it is derived from fifteen seconds of capture, and fifteen seconds of a
+        three-minute take is not the take. Measured on real material the
+        low-mids of the capture ran 3-5 dB hotter than the file average, and the
+        tone stage happily cut a hole that only existed in the sample.
+      - a singer who turns off-axis, leans in, or punches in from a different
+        position brings a different spectrum with them. No single static curve
+        is right for all of them.
+
+    So the stage measures its own OUTPUT, compares it to the target curve and
+    integrates the difference back into the filter gains. Filter overlap,
+    whatever the stages upstream did, and drift over the take all fall out of
+    the loop automatically, because they are all just error.
+
+    Deliberately slow: the integrator gain and the measurement window are set so
+    the loop settles over seconds. Anything quick enough to follow a phrase
+    would flatten the tonal difference between phrases, which is performance,
+    not a fault.
+*/
+class AdaptiveToneMatch
+{
+public:
+    static constexpr int fftOrder = 12;          // 4096: the resolution the
+    static constexpr int fftSize  = 1 << fftOrder;   // LISTEN pass measures at
+    static constexpr int hopSize  = fftSize / 2;
+
+    void prepare (double sampleRate, int maxBlockSize, int numChannels);
+    void reset();
+
+    /** Where the loop starts. `amount` is the EQ trim knob. */
+    void setBase (const std::array<float, numToneBands>& baseDb, float amount);
+    void setNoiseFloorDb (float db) noexcept { noiseFloorDb = db; }
+
+    void process (juce::AudioBuffer<float>&);
+
+    /** Largest departure the loop has made from the static curve, in dB. */
+    float getMaxTrimDb() const noexcept { return maxTrimDb; }
+    /** Live filter gains, for diagnostics. */
+    const std::array<float, numToneBands>& getGainsDb() const noexcept { return gainDb; }
+    int   getUpdateCount() const noexcept { return updates; }
+
+private:
+    void pushAnalysis (const float* x, int n);
+    void analyseFrame();
+    void integrate();
+    void applyGains();
+
+    double sr = 44100.0;
+    int    channels = 1;
+
+    juce::dsp::FFT fft { fftOrder };
+    juce::dsp::WindowingFunction<float> win { (size_t) fftSize,
+                                              juce::dsp::WindowingFunction<float>::hann };
+
+    std::vector<float> ring, scratch, powerAccum;
+    int   ringPos = 0, sinceHop = 0, framesSeen = 0, framesSinceUpdate = 0;
+    float progPeak = 0.0f, peakDecay = 0.0f, accumLeak = 0.0f;
+    int   framesPerUpdate = 12;
+
+    std::array<float, numToneBands> base {}, gainDb {}, measuredDb {};
+    std::array<juce::dsp::IIR::Filter<float>, numToneBands> filters[2];
+    std::array<bool, numToneBands> active {};
+
+    float noiseFloorDb = -90.0f;
+    float maxTrimDb = 0.0f;
+    int   updates = 0;
+    bool  seeded = false;
+};
+
+//==============================================================================
 /** Split-band de-esser: only the sibilant band ducks. */
 class DeEsser
 {
@@ -281,7 +436,13 @@ private:
 
         de-clip -> plosive guard -> HPF
              -> [de-noise + de-verb + resonance, one STFT] -> gate
-             -> surgical EQ -> compression -> de-ess -> tone match -> limiter
+             -> upward expander -> surgical EQ -> compression
+             -> de-ess -> tone match -> limiter
+
+    The upward expander sits between the gate and the compressor on purpose:
+    after the gate, so the room tone it just pulled down is not lifted straight
+    back; before the compressor, so the compressor arrives at a signal that
+    already needs less gain reduction.
 
     The corrective half does no pitch work at all: correcting intonation is an
     effect, and it belongs on the other side of the bypass.
@@ -310,6 +471,10 @@ public:
     float getResonanceReductionDb() const noexcept { return spectral[0].getResonanceReductionDb(); }
     int   getResonanceBinCount()    const noexcept { return spectral[0].getResonanceBinCount(); }
     int   getDeclippedCount() const noexcept     { return deClip.getRepairedCount(); }
+    float getUpwardBoostDb() const noexcept      { return upward.getMaxBoostDb(); }
+    float getToneTrimDb() const noexcept         { return tone.getMaxTrimDb(); }
+    const std::array<float, numToneBands>& getToneGainsDb() const noexcept { return tone.getGainsDb(); }
+    int   getToneUpdateCount() const noexcept    { return tone.getUpdateCount(); }
 
 private:
     void updateFilters();
@@ -324,17 +489,23 @@ private:
 
     static constexpr int maxSurgical = 8;
 
-    // Two cascaded Butterworth sections: 24 dB/oct. A single section leaves
-    // rumble an octave down only 12 dB attenuated while already pulling on the
-    // chest register just above the corner.
-    juce::dsp::IIR::Filter<float> hpf[2], hpf2[2];
+    // Three cascaded Butterworth sections: 36 dB/oct.
+    //
+    // The steepness is free. A sixth-order Butterworth is 0.02 dB down half an
+    // octave above its corner where a fourth-order one is 0.4 dB down, but 4.4
+    // dB further down an octave below it. The tone bank cannot make up that
+    // difference: the target curve falls 6 dB per third-octave under 100 Hz,
+    // which is a steeper slope than a bank of third-octave peaking filters can
+    // synthesise once it is smoothed enough not to comb.
+    juce::dsp::IIR::Filter<float> hpf[2], hpf2[2], hpf3[2];
     std::array<juce::dsp::IIR::Filter<float>, maxSurgical>    surgical[2];
-    std::array<juce::dsp::IIR::Filter<float>, numToneBands>   toneBands[2];
-    int numSurgical = 0, numTone = 0;
+    int numSurgical = 0;
+    AdaptiveToneMatch tone;
 
     DeClipper      deClip;
     PlosiveGuard   plosive;
     SpectralEngine spectral[2];
+    UpwardExpander upward;
     DualCompressor comp;
     DeEsser        deEss;
 
@@ -353,6 +524,7 @@ private:
     float gateAttackCoef = 0.0f, gateReleaseCoef = 0.0f, gateRangeLin = 0.1f;
     float gateEnv = 1.0f;
     bool  gateOpen = false;
+    std::vector<float> gateTrace;   // per-sample gate gain, handed to the lift
 
     float progEnv = 0.0f, progReleaseCoef = 0.0f;
     float relativeOffsetLin = 0.0f;   // threshold as a fraction of programme

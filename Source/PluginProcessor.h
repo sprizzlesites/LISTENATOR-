@@ -40,6 +40,7 @@ namespace pid
     inline constexpr const char* bpDeNoise   = "bpDeNoise";
     inline constexpr const char* bpDeVerb    = "bpDeVerb";
     inline constexpr const char* bpGate      = "bpGate";
+    inline constexpr const char* bpUpward    = "bpUpward";
     inline constexpr const char* bpSurgical  = "bpSurgical";
     inline constexpr const char* bpResonance = "bpResonance";
     inline constexpr const char* bpDeEss     = "bpDeEss";
@@ -104,6 +105,10 @@ public:
     float getDetectedHz() const noexcept { return effects.getDetectedHz(); }
     float getPlosiveReductionDb() const noexcept { return cleanup.getPlosiveReductionDb(); }
     int   getDeclippedCount() const noexcept     { return cleanup.getDeclippedCount(); }
+    float getUpwardBoostDb() const noexcept      { return cleanup.getUpwardBoostDb(); }
+    float getToneTrimDb() const noexcept         { return cleanup.getToneTrimDb(); }
+    const std::array<float, numToneBands>& getToneGainsDb() const noexcept { return cleanup.getToneGainsDb(); }
+    int   getToneUpdateCount() const noexcept    { return cleanup.getToneUpdateCount(); }
     float getPlosivePeakBoost() const noexcept   { return cleanup.getPlosivePeakBoost(); }
     float getResonanceReductionDb() const noexcept { return cleanup.getResonanceReductionDb(); }
     int   getResonanceBinCount()    const noexcept { return cleanup.getResonanceBinCount(); }

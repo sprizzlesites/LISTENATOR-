@@ -96,6 +96,28 @@ struct AnalysisResult
     float compPeakAttackMs  = 5.0f,  compPeakReleaseMs  = 80.0f;
     float makeupGainDb      = 0.0f;
 
+    // Upward expansion. The one thing downward compression cannot do is raise a
+    // quiet syllable; squashing everything else down to meet it is what makes a
+    // heavily compressed vocal sound choppy. All three levels are expressed
+    // RELATIVE to the running programme level so a take punched in 10 dB low is
+    // treated the same as one at nominal level.
+    float upwardRatio        = 1.6f;    // >1, how hard the lift is
+    float upwardThresholdDb  = -4.0f;   // below the programme average: lift starts
+    float upwardFloorDb      = -12.0f;  // below it: lift is at maximum
+    float upwardFadeDb       = 6.0f;    // width of the taper under the floor
+    float upwardMaxBoostDb   = 6.0f;
+    float upwardReferenceDb  = -24.0f;  // seed for the programme follower
+
+    // Plosive guard. Two bands: everything under plosiveCornerHz ducks by the
+    // full depth, the octave above it by half, which approximates sweeping a
+    // high-pass upward without retuning coefficients per sample.
+    float plosiveCornerHz    = 110.0f;
+    float plosiveUpperHz     = 240.0f;
+    float plosiveDepthDb     = -14.0f;
+    float plosiveSensitivity = 2.0f;    // LF transient ratio that counts as a pop
+    float plosiveRate        = 0.0f;    // measured events per second, diagnostic
+    float plosivePeakRatio   = 0.0f;    // measured worst LF transient ratio
+
     float saturationDrive = 0.0f;   // 0..1 from measured dryness/dynamics
 
     std::vector<Resonance> resonances;              // surgical notches
@@ -104,6 +126,10 @@ struct AnalysisResult
     std::vector<Resonance> resonanceCandidates;
     std::array<float, numToneBands> measuredLtasDb {};  // what came in
     std::array<float, numToneBands> noiseLtasDb    {};  // spectrum of the quiet frames
+    /** Spectrum the tone stage actually SEES, measured by running the capture
+        through the rest of the chain. The difference between this and
+        measuredLtasDb is everything the corrective stages did. */
+    std::array<float, numToneBands> probeLtasDb    {};
     std::array<float, numToneBands> toneMatchDb    {};  // correction we want
     /** Per-filter gains that actually PRODUCE toneMatchDb once the overlap
         between neighbouring 1/3-octave peaking filters is accounted for.

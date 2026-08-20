@@ -1,4 +1,5 @@
 #include "VocalAnalyzer.h"
+#include "DSP/CleanupChain.h"
 #include <cmath>
 #include <algorithm>
 #include <numeric>
@@ -174,8 +175,14 @@ void VocalAnalyzer::analyse()
     computeResonances   (r);
     computeReverb       (r);
     deriveSettings      (r);
+    computePlosives     (r);
 
+    // Before the probe pass, not after: CleanupChain refuses to process until
+    // it has been handed a valid result, so a probe run against an invalid one
+    // measures the raw capture and silently calibrates nothing.
     r.valid = true;
+    calibrateToneMatch  (r);
+
     published = r;
 }
 
@@ -970,9 +977,16 @@ void VocalAnalyzer::deriveSettings (AnalysisResult& r)
     //   2. where the measured spectrum has genuinely fallen away
     // Take the lower. Cutting into the chest register to chase a bad pitch
     // reading is how an automatic HPF hollows out a male voice.
+    const bool pitchIsCredible = r.f0P05Hz > 50.0f && r.voicedFraction > 0.10f;
+
     float fromPitch = 110.0f;
-    if (r.f0P05Hz > 0.0f && r.voicedFraction > 0.10f)
-        fromPitch = std::clamp (r.f0P05Hz * 0.62f, 45.0f, 110.0f);
+    if (pitchIsCredible)
+        // 0.78 of the lowest note, because the filter is sixth order now. At 36
+        // dB/oct a corner a third of an octave under the lowest note costs it
+        // 0.3 dB, where the same corner at 12 dB/oct would cost 2.5 -- being
+        // able to sit closer is the entire reason for the extra sections, and
+        // every Hz of it is worth 1.8 dB of rumble rejection an octave down.
+        fromPitch = std::clamp (r.f0P05Hz * 0.78f, 45.0f, 120.0f);
 
     float fromSpectrum = 80.0f;
     {
@@ -992,7 +1006,7 @@ void VocalAnalyzer::deriveSettings (AnalysisResult& r)
             const float f = toneBandHz[(size_t) b];
             if (f > 200.0f) continue;
             if (r.measuredLtasDb[(size_t) b] < bodyDb - 14.0f)
-            { fromSpectrum = std::clamp (f * 1.15f, 40.0f, 110.0f); break; }
+            { fromSpectrum = std::clamp (f * 1.15f, 40.0f, 120.0f); break; }
         }
     }
 
@@ -1000,7 +1014,13 @@ void VocalAnalyzer::deriveSettings (AnalysisResult& r)
     // slope: at 24 dB/oct the filter is 0.7 dB down at 100 Hz but 20 dB down at
     // 50 Hz, where a single section left a -6.6 dB hole in the chest register
     // AND +4.7 dB of surviving rumble.
-    r.highPassHz = std::clamp (std::min (fromPitch, fromSpectrum), 45.0f, 110.0f);
+    // The lowest note is the measurement that matters, and the spectrum estimate
+    // is the fallback for when the pitch track cannot be trusted -- NOT a lower
+    // bound on it. Taking the minimum of the two let rumble set the corner:
+    // more rubbish under the voice means the spectrum takes longer to fall away,
+    // which pushed the estimate DOWN and left the filter unable to remove it.
+    r.highPassHz = std::clamp (pitchIsCredible ? fromPitch : fromSpectrum,
+                               45.0f, 120.0f);
 
     // ---- gate --------------------------------------------------------------
     // The threshold has to clear the noise floor AND stay under the quietest
@@ -1020,8 +1040,13 @@ void VocalAnalyzer::deriveSettings (AnalysisResult& r)
     // of frame-to-frame spectral instability in the whole chain (+2.1 dB of
     // musical noise); deep fast expansion on a reverberant take chatters, and
     // chatter is more audible than the room it removes.
-    r.gateRangeDb   = -std::clamp (std::max ((40.0f - r.snrDb) * 0.45f,
-                                             r.reverbRatio * 11.0f), 3.0f, 12.0f);
+    // Shallower than it used to be. The upward expander downstream now handles
+    // the "quiet delivery sits too low" half of the problem, so the gate no
+    // longer has to dig as deep to make the gaps read as quiet -- and per-stage
+    // measurement puts it top of the list for frame-to-frame spectral
+    // instability, so every dB it gives back is a dB of chatter saved.
+    r.gateRangeDb   = -std::clamp (std::max ((40.0f - r.snrDb) * 0.40f,
+                                             r.reverbRatio * 9.0f), 3.0f, 9.0f);
     r.gateAttackMs  = 1.5f;
     // release tracks the room so gating doesn't chop the natural tail
     // Deliberately NOT tied to RT60. The old rule stretched the release to
@@ -1093,7 +1118,11 @@ void VocalAnalyzer::deriveSettings (AnalysisResult& r)
     // whole de-verb chain recovered. This stage exists to catch occasional
     // peaks, not to level; the leveller above does the levelling, slowly enough
     // that syllable-rate modulation survives it.
-    r.compPeakThreshDb  = r.integratedLufs + std::clamp (crest * 0.75f, 6.0f, 18.0f);
+    // Low enough to actually meet the transients. At crest * 0.75 the threshold
+    // landed at -4.7 dBFS on real material, which is above almost everything
+    // the stage was supposed to catch -- the limiter was doing its job instead,
+    // and a limiter is a worse-sounding transient control than a 3:1 stage.
+    r.compPeakThreshDb  = r.integratedLufs + std::clamp (crest * 0.45f, 5.0f, 12.0f);
     r.compPeakRatio     = std::clamp (1.8f + crest / 14.0f, 2.0f, 3.2f);
     // Not razor-fast: a very short attack on a peak stage modulates the
     // waveform itself rather than its envelope, and that reads as grit.
@@ -1112,7 +1141,7 @@ void VocalAnalyzer::deriveSettings (AnalysisResult& r)
 
     // ---- de-esser depth from how far the loud esses overshoot the threshold
     // Depth follows how far the esses stick out of the body, not a fixed value.
-    r.deEssMaxReductionDb = -std::clamp (r.sibilantSpreadDb * 0.35f, 3.0f, 12.0f);
+    r.deEssMaxReductionDb = -std::clamp (r.sibilantSpreadDb * 0.45f, 3.0f, 14.0f);
 
     // ---- saturation: dull/thin sources want more, bright ones want less ----
     {
@@ -1123,14 +1152,176 @@ void VocalAnalyzer::deriveSettings (AnalysisResult& r)
                                         0.0f, 1.0f);
     }
 
-    // ---- tone match against the universal target ---------------------------
-    // Align both curves on their 200 Hz-2 kHz average so we correct shape, not level.
+    // ---- upward expansion --------------------------------------------------
+    // The gap this stage has to close: how far the quietest real delivery sits
+    // under the programme level. Everything else follows from it, so a take
+    // that is already consistent gets almost no upward expansion.
+    {
+        const float quietGapDb = std::clamp (r.integratedLufs - r.speechFloorDb,
+                                             3.0f, 24.0f);
+
+        // Start lifting a little under the average -- not at it, or every
+        // syllable decay would be pushed back up and the valleys between words
+        // would fill in, which reads as room rather than as consistency.
+        // Just under the average, not well under it. The reference the stage
+        // works against is the mean of the delivery, so a threshold several dB
+        // below it leaves the quiet takes barely inside the working range and
+        // the stage does nothing measurable.
+        r.upwardThresholdDb = -std::clamp (quietGapDb * 0.15f, 1.5f, 3.0f);
+        r.upwardFloorDb     = -std::clamp (quietGapDb + 6.0f, 10.0f, 20.0f);
+        r.upwardFadeDb      = 6.0f;
+
+        // Capped well short of "level everything from below". A high upward
+        // ratio at syllable rate is just a compressor pointed the other way,
+        // and it flattens the envelope exactly as badly.
+        r.upwardRatio = std::clamp (1.5f + quietGapDb / 12.0f, 1.5f, 2.6f);
+
+        const float span  = -(r.upwardFloorDb - r.upwardThresholdDb);
+        const float slope = 1.0f - 1.0f / r.upwardRatio;
+        r.upwardMaxBoostDb = std::clamp (span * slope, 2.0f, 9.0f);
+
+        // Seed for the programme follower, so the first four seconds are not
+        // processed against a reference that has not converged yet. The
+        // detector is a peak follower, hence the offset above the mean.
+        r.upwardReferenceDb = r.integratedLufs + std::clamp (crest * 0.35f, 3.0f, 10.0f);
+    }
+
+    // ---- plosive guard bands -----------------------------------------------
+    // Above the high-pass, not below it. A guard whose band sits inside the
+    // high-pass stopband only removes what was leaving anyway; the part of a
+    // pop that actually survives into the mix lives between the corner and
+    // roughly 250 Hz.
+    r.plosiveCornerHz = std::clamp (std::max (r.highPassHz * 1.35f, 95.0f), 95.0f, 170.0f);
+    r.plosiveUpperHz  = std::clamp (r.plosiveCornerHz * 2.2f, 200.0f, 340.0f);
+
+    solveToneFilterGainsFromMeasured (r);
+}
+
+/** Provisional tone curve straight off the raw capture. calibrateToneMatch
+    replaces it with a closed-loop version once the chain settings exist; this
+    one still has to be sane because the probe pass runs with it in place. */
+void VocalAnalyzer::solveToneFilterGainsFromMeasured (AnalysisResult& r)
+{
+    toneTargetFrom (r.measuredLtasDb, r.noiseFloorDb, r.toneMatchDb);
+    solveToneGainsInto (r.toneMatchDb, r.toneFilterGainDb);
+    r.toneFilterGainDbNoNotch = r.toneFilterGainDb;
+}
+
+//==============================================================================
+/** Same detector the PlosiveGuard runs, over the capture. Sensitivity and depth
+    are then set from what the recording actually contains: a take with three
+    hard pops in fifteen seconds wants a deep guard, and one with none wants a
+    guard that never fires rather than one held off by a lucky constant. */
+void VocalAnalyzer::computePlosives (AnalysisResult& r)
+{
+    if (captureLen < (int) sr) return;
+
+    juce::dsp::ProcessSpec spec { sr, 512, 1 };
+    juce::dsp::LinkwitzRileyFilter<float> lowSplit, upSplit;
+    lowSplit.prepare (spec);
+    upSplit.prepare (spec);
+    lowSplit.setCutoffFrequency (r.plosiveCornerHz);
+    upSplit.setCutoffFrequency  (r.plosiveUpperHz);
+
+    PlosiveGuard::Detector det;
+    det.prepare (sr);
+
+    // Provisional trip point, only used to collect the population of LF
+    // transients; the real one is a percentile of what comes back.
+    constexpr float probeRatio = 1.6f;
+    const int refractoryLen = (int) (0.12 * sr);
+    int refractory = 0;
+
+    std::vector<float> boosts, contrasts;
+    float worst = 0.0f;
+
+    for (int i = 0; i < captureLen; ++i)
+    {
+        float sub = 0.0f, rest = 0.0f, mid = 0.0f, top = 0.0f;
+        lowSplit.processSample (0, capture[(size_t) i], sub, rest);
+        upSplit.processSample  (0, rest, mid, top);
+
+        const float lo = std::abs (sub) + std::abs (mid);
+        const auto d = det.push (lo, std::abs (top));
+
+        if (refractory > 0) --refractory;
+
+        if (lo > 3.0e-4f && d.lfBoost > probeRatio && d.contrast > 1.8f)
+        {
+            worst = std::max (worst, d.contrast);
+            if (refractory <= 0)
+            {
+                boosts.push_back (d.lfBoost);
+                contrasts.push_back (d.contrast);
+                refractory = refractoryLen;
+            }
+            else if (! contrasts.empty())
+            {
+                boosts.back()    = std::max (boosts.back(), d.lfBoost);
+                contrasts.back() = std::max (contrasts.back(), d.contrast);
+            }
+        }
+    }
+
+    r.plosivePeakRatio = worst;
+    r.plosiveRate = (float) contrasts.size() / std::max (1.0f, (float) captureLen / (float) sr);
+
+    if (contrasts.empty())
+    {
+        // Nothing that looks like a pop: leave the guard armed but shallow.
+        r.plosiveSensitivity = 2.5f;
+        r.plosiveDepthDb     = -6.0f;
+        return;
+    }
+
+    // The gate on the low band's own jump stays low: the contrast test is what
+    // separates a pop from a word, and a high gate here just loses the quiet
+    // ones. Set under most of the population so real pops clear it easily.
+    r.plosiveSensitivity = std::clamp (percentile (boosts, 0.35f), 1.6f, 3.0f);
+
+    // Depth from how lopsided the worst events are. Measured in dB on the same
+    // contrast the guard uses, so the two cannot drift apart.
+    const float p85Db = 20.0f * std::log10 (std::max (percentile (contrasts, 0.85f), 1.0f));
+    r.plosiveDepthDb = -std::clamp (6.0f + (p85Db - 6.0f) * 1.1f, 6.0f, 20.0f);
+}
+
+//==============================================================================
+void VocalAnalyzer::ltasOf (const float* data, int len,
+                            std::array<float, numToneBands>& outDb)
+{
+    std::vector<float> power ((size_t) fftSize / 2, 0.0f);
+    int numFrames = 0;
+
+    for (int start = 0; start + fftSize <= len; start += hopSize)
+    {
+        std::fill (fftScratch.begin(), fftScratch.end(), 0.0f);
+        std::memcpy (fftScratch.data(), data + start, sizeof (float) * (size_t) fftSize);
+        window.multiplyWithWindowingTable (fftScratch.data(), (size_t) fftSize);
+        fft.performFrequencyOnlyForwardTransform (fftScratch.data());
+
+        for (int i = 0; i < fftSize / 2; ++i)
+            power[(size_t) i] += fftScratch[(size_t) i] * fftScratch[(size_t) i];
+        ++numFrames;
+    }
+
+    if (numFrames > 0)
+        for (auto& v : power) v /= (float) numFrames;
+
+    powerToBands (power, outDb);
+}
+
+/** Target minus measured, aligned on the 200 Hz-2 kHz average so we correct
+    shape rather than level. */
+void VocalAnalyzer::toneTargetFrom (const std::array<float, numToneBands>& measured,
+                                    float noiseFloorDb,
+                                    std::array<float, numToneBands>& out) const
+{
     float measRef = 0.0f, tgtRef = 0.0f; int refCount = 0;
     for (int b = 0; b < numToneBands; ++b)
     {
         const float f = toneBandHz[(size_t) b];
         if (f < 200.0f || f > 2000.0f) continue;
-        measRef += r.measuredLtasDb[(size_t) b];
+        measRef += measured[(size_t) b];
         tgtRef  += kTargetLtasDb[(size_t) b];
         ++refCount;
     }
@@ -1139,11 +1330,11 @@ void VocalAnalyzer::deriveSettings (AnalysisResult& r)
     std::array<float, numToneBands> raw {};
     for (int b = 0; b < numToneBands; ++b)
     {
-        const float meas = r.measuredLtasDb[(size_t) b] - measRef;
-        const float tgt  = kTargetLtasDb[(size_t) b]    - tgtRef;
+        const float meas = measured[(size_t) b] - measRef;
+        const float tgt  = kTargetLtasDb[(size_t) b] - tgtRef;
 
         // Don't chase bands that are essentially noise
-        if (r.measuredLtasDb[(size_t) b] < r.noiseFloorDb + 6.0f)
+        if (measured[(size_t) b] < noiseFloorDb + 6.0f)
         { raw[(size_t) b] = 0.0f; continue; }
 
         // Asymmetric on purpose: a cut can only ever remove something that is
@@ -1151,7 +1342,11 @@ void VocalAnalyzer::deriveSettings (AnalysisResult& r)
         // band -- noise, room, sibilance. Boosts are also tightened further up
         // top, where there is least signal and most junk.
         const float maxBoost = toneBandHz[(size_t) b] > 8000.0f ? 2.5f : 4.0f;
-        raw[(size_t) b] = std::clamp (tgt - meas, -8.0f, maxBoost);
+        // Deeper cuts allowed under 100 Hz. Nothing a lead vocal needs lives
+        // there, so the usual "don't carve holes" caution does not apply, and
+        // the 8 dB limit was leaving 6 dB of measured rumble in place.
+        const float maxCut = toneBandHz[(size_t) b] < 100.0f ? -16.0f : -8.0f;
+        raw[(size_t) b] = std::clamp (tgt - meas, maxCut, maxBoost);
     }
 
     // 3-band smoothing: broad tonal moves, never a comb
@@ -1159,11 +1354,8 @@ void VocalAnalyzer::deriveSettings (AnalysisResult& r)
     {
         const int a = std::max (0, b - 1);
         const int c = std::min (numToneBands - 1, b + 1);
-        r.toneMatchDb[(size_t) b] =
-            (raw[(size_t) a] + raw[(size_t) b] + raw[(size_t) c]) / 3.0f;
+        out[(size_t) b] = (raw[(size_t) a] + raw[(size_t) b] + raw[(size_t) c]) / 3.0f;
     }
-
-    solveToneFilterGains (r);
 }
 
 /** Adjacent 1/3-octave peaking filters overlap, so a cascade of them does NOT
@@ -1174,25 +1366,12 @@ void VocalAnalyzer::deriveSettings (AnalysisResult& r)
     contributes at band i's centre. Gauss-Seidel converges in a few sweeps
     because M is strongly diagonally dominant. Done here on the analysis
     thread so the audio thread never sees the cost. */
-void VocalAnalyzer::solveToneFilterGains (AnalysisResult& r) const
-{
-    solveToneGainsInto (r, true,  r.toneFilterGainDb);
-    solveToneGainsInto (r, false, r.toneFilterGainDbNoNotch);
-}
-
-void VocalAnalyzer::solveToneGainsInto (const AnalysisResult& r, bool withNotches,
+void VocalAnalyzer::solveToneGainsInto (const std::array<float, numToneBands>& target,
                                         std::array<float, numToneBands>& result) const
 {
     // A 1/3-octave bandwidth corresponds to Q ~ 4.32.
     const float p = std::pow (2.0f, 1.0f / 3.0f);
     const float q = std::sqrt (p) / (p - 1.0f);
-
-    // What the rest of the chain will do to the spectrum AFTER this curve was
-    // measured. The target has to be adjusted by it, or the tone stage spends
-    // its effort fighting the high-pass and the notches instead of shaping tone.
-    std::array<float, numToneBands> chain {};
-    if (withNotches) accumulateChainResponse (r, chain);
-    else             chain.fill (0.0f);
 
     std::array<std::array<float, numToneBands>, numToneBands> m {};
 
@@ -1232,8 +1411,7 @@ void VocalAnalyzer::solveToneGainsInto (const AnalysisResult& r, bool withNotche
             for (int j = 0; j < numToneBands; ++j)
                 if (j != i) sum += m[(size_t) i][(size_t) j] * g[(size_t) j];
 
-            const float target = r.toneMatchDb[(size_t) i] - chain[(size_t) i];
-            const float want = (target - sum) / diag;
+            const float want = (target[(size_t) i] - sum) / diag;
             // damped update keeps the sweep stable on the wide low bands
             g[(size_t) i] = std::clamp (g[(size_t) i] + 0.7f * (want - g[(size_t) i]),
                                         -12.0f, 12.0f);
@@ -1243,30 +1421,82 @@ void VocalAnalyzer::solveToneGainsInto (const AnalysisResult& r, bool withNotche
     result = g;
 }
 
-void VocalAnalyzer::accumulateChainResponse (const AnalysisResult& r,
-                                             std::array<float, numToneBands>& out) const
+//==============================================================================
+/** Run the capture through the corrective chain with the tone stage muted, so
+    the tone curve can be matched against what actually reaches it.
+
+    Modelling this instead of measuring it was the single largest tonal error in
+    the plugin: the target was derived from the raw capture, but by the time the
+    signal arrives at the tone stage the high-pass, the plosive guard, the
+    spectral de-verb, the notches and the compressor have all reshaped it, so
+    the stage spent its budget cutting things that had already gone. It measured
+    as 6.4 dB of missing chest register on real material. */
+void VocalAnalyzer::runProbe (const AnalysisResult& r, bool withNotches,
+                              std::vector<float>& out)
 {
-    out.fill (0.0f);
+    constexpr int probeBlock = 512;
 
-    // Deliberately excludes the high-pass. Compensating for it would have the
-    // tone stage boost back exactly what the filter is there to remove -- which
-    // measured as +19.6 dB of surviving rumble at 50 Hz when tried. Only the
-    // notches belong here: their skirts reach into neighbouring bands as a side
-    // effect, and that part is worth cancelling.
-    for (int b = 0; b < numToneBands; ++b)
+    CleanupChain chain;
+    chain.prepare (sr, probeBlock, 1);
+
+    CleanupBypass bp;
+    bp.toneMatch  = true;               // the stage being calibrated
+    bp.limiter    = true;               // must not clip the measurement
+    bp.surgicalEq = ! withNotches;
+    bp.resonance  = ! withNotches;
+    chain.setBypass (bp);
+    chain.applyAnalysis (r);
+
+    juce::AudioBuffer<float> buf (1, probeBlock);
+    out.clear();
+    out.reserve ((size_t) captureLen);
+
+    // Two passes: the first lets the gate, the upward expander and both
+    // compressors converge, the second is what gets measured. A cold chain
+    // spends its first seconds at the wrong gain, and averaging that into the
+    // spectrum biases the whole curve.
+    for (int pass = 0; pass < 2; ++pass)
     {
-        const float f = toneBandHz[(size_t) b];
-        if (f >= sr * 0.45) continue;
+        chain.reset();
+        if (pass == 1) out.clear();
 
-        for (const auto& res : r.resonances)
+        for (int i = 0; i + probeBlock <= captureLen; i += probeBlock)
         {
-            auto c = juce::dsp::IIR::Coefficients<float>::makePeakFilter (
-                         sr, res.frequencyHz, res.q, std::pow (10.0f, res.gainDb / 20.0f));
-            const float rm = (float) c->getMagnitudeForFrequency (f, sr);
-            if (rm > 1.0e-6f)
-                out[(size_t) b] += 20.0f * std::log10 (rm);
+            std::memcpy (buf.getWritePointer (0), capture.data() + i,
+                         sizeof (float) * (size_t) probeBlock);
+            chain.process (buf);
+            if (pass == 1)
+                out.insert (out.end(), buf.getReadPointer (0),
+                            buf.getReadPointer (0) + probeBlock);
         }
     }
+
+    const int latency = chain.getLatencySamples();
+    if (latency > 0 && (int) out.size() > latency)
+        out.erase (out.begin(), out.begin() + latency);
+}
+
+void VocalAnalyzer::calibrateToneMatch (AnalysisResult& r)
+{
+    std::vector<float> probe;
+    std::array<float, numToneBands> processedLtas {};
+
+    runProbe (r, true, probe);
+    if ((int) probe.size() < fftSize * 2) return;   // too little to measure
+    ltasOf (probe.data(), (int) probe.size(), processedLtas);
+    r.probeLtasDb = processedLtas;
+    toneTargetFrom (processedLtas, r.noiseFloorDb, r.toneMatchDb);
+    solveToneGainsInto (r.toneMatchDb, r.toneFilterGainDb);
+
+    // The no-notch solve gets its own probe: switching the notches off changes
+    // the spectrum by several dB around each one, and a curve solved with them
+    // in circuit is simply wrong the moment they leave it.
+    runProbe (r, false, probe);
+    if ((int) probe.size() < fftSize * 2) { r.toneFilterGainDbNoNotch = r.toneFilterGainDb; return; }
+    std::array<float, numToneBands> noNotchTarget {};
+    ltasOf (probe.data(), (int) probe.size(), processedLtas);
+    toneTargetFrom (processedLtas, r.noiseFloorDb, noNotchTarget);
+    solveToneGainsInto (noNotchTarget, r.toneFilterGainDbNoNotch);
 }
 
 } // namespace listenator

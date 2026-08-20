@@ -59,14 +59,25 @@ private:
     void computeResonances   (AnalysisResult&);
     void computeReverb       (AnalysisResult&);
     void computeLoudness     (AnalysisResult&);
+    void computePlosives     (AnalysisResult&);
     void deriveSettings      (AnalysisResult&);
-    void solveToneFilterGains (AnalysisResult&) const;
-    void solveToneGainsInto (const AnalysisResult&, bool withNotches,
-                             std::array<float, numToneBands>&) const;
-    /** Response of the stages that reshape the spectrum downstream of where the
-        tone target is computed, so the solve can cancel them. */
-    void accumulateChainResponse (const AnalysisResult&,
-                                  std::array<float, numToneBands>&) const;
+
+    /** Welch-averaged 1/3-octave spectrum of an arbitrary buffer. */
+    void ltasOf (const float* data, int len, std::array<float, numToneBands>&);
+    /** Open-loop first guess, in place until the probe pass replaces it. */
+    void solveToneFilterGainsFromMeasured (AnalysisResult&);
+    /** Target minus measured, clamped and smoothed: the curve we want. */
+    void toneTargetFrom (const std::array<float, numToneBands>& measured,
+                         float noiseFloorDb,
+                         std::array<float, numToneBands>& out) const;
+    /** Gains that PRODUCE `target` once neighbouring 1/3-octave filters overlap. */
+    void solveToneGainsInto (const std::array<float, numToneBands>& target,
+                             std::array<float, numToneBands>& result) const;
+    /** Closed loop: run the capture through the corrective chain with the tone
+        stage muted and match what actually arrives there, instead of matching
+        the raw input and cutting everything upstream already removed. */
+    void calibrateToneMatch (AnalysisResult&);
+    void runProbe (const AnalysisResult&, bool withNotches, std::vector<float>& out);
 
     double sr = 44100.0;
 

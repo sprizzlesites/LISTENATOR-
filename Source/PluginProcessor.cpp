@@ -67,6 +67,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout ListenatorProcessor::createL
     bp (pid::bpDeClip,   "Bypass De-Clip");   bp (pid::bpPlosive,  "Bypass Plosive");
     bp (pid::bpHighPass, "Bypass HPF");        bp (pid::bpDeNoise,  "Bypass De-Noise");
     bp (pid::bpDeVerb,   "Bypass De-Verb");    bp (pid::bpGate,     "Bypass Gate");
+    bp (pid::bpUpward,   "Bypass Upward");
     bp (pid::bpSurgical, "Bypass Surgical");   bp (pid::bpResonance,"Bypass Resonance");
     bp (pid::bpDeEss,    "Bypass De-Ess");     bp (pid::bpComp,     "Bypass Comp");
     bp (pid::bpTone,     "Bypass Tone");       bp (pid::bpLimiter,  "Bypass Limiter");
@@ -168,6 +169,7 @@ void ListenatorProcessor::pullParameters()
     cb.deNoise    = flag (pid::bpDeNoise);
     cb.deVerb     = flag (pid::bpDeVerb);
     cb.gate       = flag (pid::bpGate);
+    cb.upward     = flag (pid::bpUpward);
     cb.surgicalEq = flag (pid::bpSurgical);
     cb.resonance  = flag (pid::bpResonance);
     cb.deEss      = flag (pid::bpDeEss);

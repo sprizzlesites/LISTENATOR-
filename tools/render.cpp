@@ -413,6 +413,12 @@ void dumpAnalysis (const AnalysisResult& a)
                  a.f1Hz, a.f2Hz, a.f3Hz, a.spectralCentroidHz, a.spectralTiltDbPerOct);
     std::printf ("  hpf       %.0f Hz\n", a.highPassHz);
     std::printf ("  speech    quietest real delivery %.1f dB\n", a.speechFloorDb);
+    std::printf ("  plosive   %.0f/%.0f Hz  depth %.1f dB  trip %.2f  (measured %.2f/s, worst ratio %.1f)\n",
+                 a.plosiveCornerHz, a.plosiveUpperHz, a.plosiveDepthDb,
+                 a.plosiveSensitivity, a.plosiveRate, a.plosivePeakRatio);
+    std::printf ("  upward    ratio %.2f  thresh %.1f  floor %.1f  max boost %.1f dB  (ref seed %.1f)\n",
+                 a.upwardRatio, a.upwardThresholdDb, a.upwardFloorDb,
+                 a.upwardMaxBoostDb, a.upwardReferenceDb);
     std::printf ("  gate      thresh %.1f dB  range %.1f dB  rel %.0f ms\n",
                  a.gateThresholdDb, a.gateRangeDb, a.gateReleaseMs);
     std::printf ("  de-ess    centre %.0f Hz  bw %.2f oct  thresh %.1f dBFS  peak %.1f  spread %.1f  max %.1f dB\n",
@@ -430,6 +436,12 @@ void dumpAnalysis (const AnalysisResult& a)
     std::printf ("\n  resonances (%d):", (int) a.resonances.size());
     for (const auto& r : a.resonances)
         std::printf ("  %.0fHz/%.1fdB/Q%.1f", r.frequencyHz, r.gainDb, r.q);
+    std::printf ("\n  probe     what the tone stage actually receives, minus the raw input (dB):\n    ");
+    for (int b = 0; b < numToneBands; ++b)
+    {
+        std::printf ("%5.1f", a.probeLtasDb[(size_t) b] - a.measuredLtasDb[(size_t) b]);
+        if ((b + 1) % 16 == 0) std::printf ("\n    ");
+    }
     std::printf ("\n  tone match (dB per 1/3-oct band, 20 Hz..20 kHz):\n    ");
     for (int b = 0; b < numToneBands; ++b)
     {
@@ -489,6 +501,16 @@ int main (int argc, char** argv)
     struct Variant { const char* name; bool cleanup; bool effects; bool deverbOnly; };
     std::vector<Variant> variants { { "cleanup", true, false, false },
                                     { "full",    true, true,  false } };
+    // Everything but the tone stage, over the WHOLE file. Its band errors are
+    // exactly what the tone curve is supposed to cancel, so comparing them to
+    // the curve separates "the 15 s capture was unrepresentative" from "the
+    // overlap solve is not delivering what it was asked for".
+    if (args.contains ("--notone"))
+        variants.push_back ({ "cleanup-notone", true, false, false });
+    // Same idea for the safety limiter: it is the only stage downstream of the
+    // tone loop, so anything the loop cannot remove has to be coming from it.
+    if (args.contains ("--nolimit"))
+        variants.push_back ({ "cleanup-nolimit", true, false, false });
     // isolate the de-verb so its contribution is measurable on its own
     if (args.contains ("--diag"))
         variants.push_back ({ "deverbonly", true, false, true });
@@ -571,6 +593,11 @@ int main (int argc, char** argv)
 
         if (args.contains ("--no-deverb"))
             setP (pid::bpDeVerb, 1.0f);
+
+        if (juce::String (variant.name) == "cleanup-notone")
+            setP (pid::bpTone, 1.0f);
+        if (juce::String (variant.name) == "cleanup-nolimit")
+            setP (pid::bpLimiter, 1.0f);
 
         if (variant.deverbOnly)
             for (auto* id : { pid::bpDeClip, pid::bpPlosive, pid::bpHighPass,
@@ -665,6 +692,15 @@ int main (int argc, char** argv)
         auto s = measure (outL, sr);
         std::printf ("  declipped %d samples   plosive guard max %.1f dB (LF transient ratio %.1f)\n",
                      p.getDeclippedCount(), worstPlosive, p.getPlosivePeakBoost());
+        std::printf ("  live tone filter gains (dB):\n    ");
+        for (int b = 0; b < numToneBands; ++b)
+        {
+            std::printf ("%6.1f", p.getToneGainsDb()[(size_t) b]);
+            if ((b + 1) % 16 == 0) std::printf ("\n    ");
+        }
+        std::printf ("\n");
+        std::printf ("  upward expander max +%.1f dB   adaptive tone: %d updates, max trim %.1f dB\n",
+                     p.getUpwardBoostDb(), p.getToneUpdateCount(), p.getToneTrimDb());
         std::printf ("  compressor max %.1f dB   de-esser max %.1f dB   dynamic EQ max %.1f dB on %d bins\n",
                      worstGr, worstDeEss, p.getResonanceReductionDb(), p.getResonanceBinCount());
         std::printf ("[%s] latency %d  ->  peak %.1f dBFS  rms %.1f  crest %.1f  LUFS %.1f  clipped %d\n",

@@ -511,40 +511,102 @@ void DeClipper::process (juce::AudioBuffer<float>& buffer)
 //==============================================================================
 // PlosiveGuard
 //==============================================================================
+void PlosiveGuard::Detector::prepare (double sampleRate) noexcept
+{
+    // Peak followers, not one-pole smoothers. A 2 ms smoother on a 110 Hz
+    // fundamental ripples at the waveform period, so the ratio it produces
+    // swings by 6 dB on a perfectly steady note.
+    fastAtk = timeCoef (1.0f,   sampleRate);
+    fastRel = timeCoef (20.0f,  sampleRate);
+    // The slow pair is a BACKGROUND level, so a 60 ms burst must not be able to
+    // move it. At a 60 ms attack it caught up with a pop inside five
+    // milliseconds and the ratio never rose past 2.9.
+    slowAtk = timeCoef (250.0f, sampleRate);
+    slowRel = timeCoef (600.0f, sampleRate);
+    reset();
+}
+
+void PlosiveGuard::Detector::reset() noexcept
+{
+    lfFast = lfSlow = hfFast = hfSlow = 0.0f;
+}
+
+PlosiveGuard::Detector::Result PlosiveGuard::Detector::push (float lo, float hi) noexcept
+{
+    auto follow = [] (float& state, float x, float atk, float rel)
+    {
+        const float c = x > state ? atk : rel;
+        state = c * state + (1.0f - c) * x;
+    };
+
+    follow (lfFast, lo, fastAtk, fastRel);
+    follow (lfSlow, lo, slowAtk, slowRel);
+    follow (hfFast, hi, fastAtk, fastRel);
+    follow (hfSlow, hi, slowAtk, slowRel);
+
+    Result r;
+    r.lfBoost = lfFast / juce::jmax (lfSlow, 1.0e-5f);
+    r.hfBoost = hfFast / juce::jmax (hfSlow, 1.0e-5f);
+    // Floored, or a burst arriving in a gap where the high band has decayed to
+    // nothing divides by zero and every one of them reads as maximum severity.
+    r.contrast = r.lfBoost / juce::jmax (r.hfBoost, 0.25f);
+    return r;
+}
+
 void PlosiveGuard::prepare (double sampleRate, int maxBlockSize, int numChannels)
 {
     sr = sampleRate;
     juce::dsp::ProcessSpec spec { sampleRate, (juce::uint32) maxBlockSize,
                                   (juce::uint32) numChannels };
-    lowBand.prepare (spec);
-    highBand.prepare (spec);
-    lowBand.setType  (juce::dsp::LinkwitzRileyFilterType::lowpass);
-    highBand.setType (juce::dsp::LinkwitzRileyFilterType::highpass);
-    setCornerHz (150.0f);
+    for (auto* f : { &splitLow, &splitLowHi, &splitUp, &splitUpHi, &subAllpass })
+        f->prepare (spec);
 
-    lowBuf.setSize (numChannels, maxBlockSize);
-    highBuf.setSize (numChannels, maxBlockSize);
+    splitLow.setType   (juce::dsp::LinkwitzRileyFilterType::lowpass);
+    splitLowHi.setType (juce::dsp::LinkwitzRileyFilterType::highpass);
+    splitUp.setType    (juce::dsp::LinkwitzRileyFilterType::lowpass);
+    splitUpHi.setType  (juce::dsp::LinkwitzRileyFilterType::highpass);
+    subAllpass.setType (juce::dsp::LinkwitzRileyFilterType::allpass);
+    setBands (110.0f, 240.0f);
 
-    attackCoef  = timeCoef (1.5f,  sampleRate);   // must catch the leading edge
-    releaseCoef = timeCoef (90.0f, sampleRate);
-    fastCoef    = timeCoef (2.0f,   sampleRate);
-    slowCoef    = timeCoef (180.0f, sampleRate);
+    subBuf.setSize (numChannels, maxBlockSize);
+    midBuf.setSize (numChannels, maxBlockSize);
+    topBuf.setSize (numChannels, maxBlockSize);
+
+    attackCoef  = timeCoef (1.0f,  sampleRate);   // must catch the leading edge
+    releaseCoef = timeCoef (60.0f, sampleRate);
+    // A pop is 20-60 ms of blast. Releasing from the first sample lets the duck
+    // decay while the burst is still going, which leaves the tail of the pop.
+    holdSamples = (int) (0.030 * sampleRate);
+    detector.prepare (sampleRate);
     reset();
 }
 
-void PlosiveGuard::setCornerHz (float hz) noexcept
+void PlosiveGuard::setBands (float cornerHz, float upperHz) noexcept
 {
-    const float f = juce::jlimit (80.0f, 250.0f, hz);
-    lowBand.setCutoffFrequency (f);
-    highBand.setCutoffFrequency (f);
+    const float f1 = juce::jlimit (70.0f, 190.0f, cornerHz);
+    const float f2 = juce::jlimit (f1 * 1.4f, 400.0f, upperHz);
+    splitLow.setCutoffFrequency   (f1);
+    splitLowHi.setCutoffFrequency (f1);
+    splitUp.setCutoffFrequency    (f2);
+    splitUpHi.setCutoffFrequency  (f2);
+    subAllpass.setCutoffFrequency (f2);
+}
+
+void PlosiveGuard::setParams (const AnalysisResult& a) noexcept
+{
+    setBands (a.plosiveCornerHz, a.plosiveUpperHz);
+    depthLin    = dbToGain (juce::jlimit (-30.0f, -3.0f, a.plosiveDepthDb));
+    sensitivity = juce::jlimit (1.4f, 6.0f, a.plosiveSensitivity);
 }
 
 void PlosiveGuard::reset()
 {
-    lowBand.reset(); highBand.reset();
-    lowBuf.clear(); highBuf.clear();
-    lfFast = lfSlow = hfFast = hfSlow = 0.0f;
+    splitLow.reset(); splitLowHi.reset(); splitUp.reset(); splitUpHi.reset();
+    subAllpass.reset();
+    subBuf.clear(); midBuf.clear(); topBuf.clear();
+    detector.reset();
     gain = 1.0f;
+    holdLeft = 0;
     lastReductionDb = 0.0f;
     peakLfBoost = 0.0f;
 }
@@ -553,22 +615,32 @@ void PlosiveGuard::process (juce::AudioBuffer<float>& buffer)
 {
     if (amount <= 0.0f) return;
 
-    const int numCh = juce::jmin (buffer.getNumChannels(), lowBuf.getNumChannels());
-    const int n = juce::jmin (buffer.getNumSamples(), lowBuf.getNumSamples());
+    const int numCh = juce::jmin (buffer.getNumChannels(), subBuf.getNumChannels());
+    const int n = juce::jmin (buffer.getNumSamples(), subBuf.getNumSamples());
     if (numCh <= 0 || n <= 0) return;
 
+    // sub = below f1, mid = f1..f2, top = above f2
     for (int ch = 0; ch < numCh; ++ch)
     {
-        lowBuf.copyFrom  (ch, 0, buffer, ch, 0, n);
-        highBuf.copyFrom (ch, 0, buffer, ch, 0, n);
+        subBuf.copyFrom (ch, 0, buffer, ch, 0, n);
+        midBuf.copyFrom (ch, 0, buffer, ch, 0, n);
     }
 
-    { juce::dsp::AudioBlock<float> b (lowBuf);
-      auto sub = b.getSubBlock (0, (size_t) n);
-      juce::dsp::ProcessContextReplacing<float> ctx (sub); lowBand.process (ctx); }
-    { juce::dsp::AudioBlock<float> b (highBuf);
-      auto sub = b.getSubBlock (0, (size_t) n);
-      juce::dsp::ProcessContextReplacing<float> ctx (sub); highBand.process (ctx); }
+    auto run = [n] (juce::dsp::LinkwitzRileyFilter<float>& f, juce::AudioBuffer<float>& b)
+    {
+        juce::dsp::AudioBlock<float> blk (b);
+        auto sub = blk.getSubBlock (0, (size_t) n);
+        juce::dsp::ProcessContextReplacing<float> ctx (sub);
+        f.process (ctx);
+    };
+
+    run (splitLow,   subBuf);   // < f1
+    run (splitLowHi, midBuf);   // > f1
+    for (int ch = 0; ch < numCh; ++ch)
+        topBuf.copyFrom (ch, 0, midBuf, ch, 0, n);
+    run (splitUp,   midBuf);    // f1 .. f2
+    run (splitUpHi, topBuf);    // > f2
+    run (subAllpass, subBuf);   // phase-align the sub band with the other two
 
     float worst = 0.0f;
 
@@ -577,40 +649,161 @@ void PlosiveGuard::process (juce::AudioBuffer<float>& buffer)
         float lo = 0.0f, hi = 0.0f;
         for (int ch = 0; ch < numCh; ++ch)
         {
-            lo = juce::jmax (lo, std::abs (lowBuf.getSample (ch, i)));
-            hi = juce::jmax (hi, std::abs (highBuf.getSample (ch, i)));
+            // The detector keys off the whole plosive region, not just the sub
+            // band: the burst spreads across both, and looking only under f1
+            // means the guard fires on whatever the high-pass was about to
+            // remove anyway.
+            lo = juce::jmax (lo, std::abs (subBuf.getSample (ch, i))
+                                 + std::abs (midBuf.getSample (ch, i)));
+            hi = juce::jmax (hi, std::abs (topBuf.getSample (ch, i)));
         }
 
-        lfFast = fastCoef * lfFast + (1.0f - fastCoef) * lo;
-        lfSlow = slowCoef * lfSlow + (1.0f - slowCoef) * lo;
-        hfFast = fastCoef * hfFast + (1.0f - fastCoef) * hi;
-        hfSlow = slowCoef * hfSlow + (1.0f - slowCoef) * hi;
-
-        // How far each band has jumped above its own recent average.
-        const float lfBoost = lfFast / juce::jmax (lfSlow, 1.0e-5f);
-        const float hfBoost = hfFast / juce::jmax (hfSlow, 1.0e-5f);
+        const auto det = detector.push (lo, hi);
 
         // A sung note lifts both bands together. A plosive, a footstep or a
-        // knock on the boom arm lifts only the bottom.
+        // knock on the boom arm lifts only the bottom, and the size of that
+        // imbalance -- not the size of the jump -- is how bad it is.
         float target = 1.0f;
-        if (lo > 3.0e-4f && lfBoost > 2.2f && lfBoost > hfBoost * 1.7f)
+        if (lo > 3.0e-4f && det.lfBoost > sensitivity && det.contrast > 1.8f)
         {
-            peakLfBoost = juce::jmax (peakLfBoost, lfBoost);
-            const float severity = juce::jlimit (0.0f, 1.0f, (lfBoost - 2.2f) / 5.0f);
-            target = juce::jmax (0.10f, 1.0f - severity * 0.9f * amount);
+            peakLfBoost = juce::jmax (peakLfBoost, det.contrast);
+            const float severity = juce::jlimit (0.0f, 1.0f,
+                                                 (gainToDb (det.contrast) - 5.0f) / 12.0f);
+            target = 1.0f - (1.0f - depthLin) * severity * amount;
         }
 
-        const float coef = target < gain ? attackCoef : releaseCoef;
-        gain = coef * gain + (1.0f - coef) * target;
+        if (target < gain)
+        {
+            gain = attackCoef * gain + (1.0f - attackCoef) * target;
+            holdLeft = holdSamples;
+        }
+        else if (holdLeft > 0)
+        {
+            --holdLeft;
+        }
+        else
+        {
+            gain = releaseCoef * gain + (1.0f - releaseCoef) * target;
+        }
+
         worst = juce::jmin (worst, gainToDb (gain));
 
-        // duck only the low band; the rest of the voice passes untouched
+        // Full depth under f1, half of it in dB over the octave above: the
+        // cheap approximation to sweeping a high-pass up and back down.
+        const float midGain = std::sqrt (gain);
         for (int ch = 0; ch < numCh; ++ch)
             buffer.setSample (ch, i,
-                              highBuf.getSample (ch, i) + lowBuf.getSample (ch, i) * gain);
+                              topBuf.getSample (ch, i)
+                              + midBuf.getSample (ch, i) * midGain
+                              + subBuf.getSample (ch, i) * gain);
     }
 
     lastReductionDb = worst;
+}
+
+//==============================================================================
+// UpwardExpander
+//==============================================================================
+void UpwardExpander::prepare (double sampleRate, int)
+{
+    sr = sampleRate;
+    // Detector: quick enough to have settled inside a syllable, slow enough on
+    // release to describe the syllable rather than the waveform.
+    envAtkCoef  = timeCoef (5.0f,   sampleRate);
+    envRelCoef  = timeCoef (200.0f, sampleRate);
+    // Quick attack, as asked for: the lift is on the punch, not after it.
+    gainAtkCoef = timeCoef (3.0f,   sampleRate);
+    gainRelCoef = timeCoef (120.0f, sampleRate);
+    // The reference is the take average, not the phrase average. Anything fast
+    // enough to follow phrases would cancel exactly the differences this stage
+    // exists to remove.
+    refCoef     = timeCoef (10000.0f, sampleRate);
+    reset();
+}
+
+void UpwardExpander::reset()
+{
+    envSq = 0.0f;
+    refLin = seedLin;
+    gain = 1.0f;
+    lastBoostDb = peakBoostDb = 0.0f;
+}
+
+void UpwardExpander::setParams (const AnalysisResult& a, float amt)
+{
+    amount = juce::jlimit (0.0f, 2.0f, amt);
+    const float ratio = juce::jlimit (1.05f, 3.0f, a.upwardRatio);
+    slope = 1.0f - 1.0f / ratio;
+    thresholdOffsetDb = juce::jlimit (-12.0f, 0.0f,  a.upwardThresholdDb);
+    floorOffsetDb     = juce::jmin (thresholdOffsetDb - 2.0f,
+                                    juce::jlimit (-30.0f, -4.0f, a.upwardFloorDb));
+    fadeDb            = juce::jlimit (2.0f, 18.0f, a.upwardFadeDb);
+    maxBoostDb        = juce::jlimit (0.0f, 14.0f, a.upwardMaxBoostDb);
+    seedLin           = dbToGain (juce::jlimit (-70.0f, 0.0f, a.upwardReferenceDb));
+    if (refLin <= 0.0f) refLin = seedLin;
+}
+
+void UpwardExpander::process (juce::AudioBuffer<float>& buffer, const float* gateWeight)
+{
+    if (amount <= 0.0f || maxBoostDb <= 0.0f) return;
+
+    const int numCh = buffer.getNumChannels();
+    const int n = buffer.getNumSamples();
+    if (numCh <= 0 || n <= 0) return;
+
+    const float boostCap = maxBoostDb * juce::jmin (amount, 2.0f);
+    // Below this the follower is looking at a gap, not at delivery; letting
+    // silence into the average would drag the reference down until the stage
+    // started lifting the room instead of the voice.
+    const float refGateLin = dbToGain (floorOffsetDb - 6.0f);
+    float worst = 0.0f;
+
+    for (int i = 0; i < n; ++i)
+    {
+        float sq = 0.0f;
+        for (int ch = 0; ch < numCh; ++ch)
+        {
+            const float v = buffer.getSample (ch, i);
+            sq = juce::jmax (sq, v * v);
+        }
+
+        const float c = sq > envSq ? envAtkCoef : envRelCoef;
+        envSq = c * envSq + (1.0f - c) * sq;
+        const float env = std::sqrt (envSq);
+
+        if (env > refLin * refGateLin)
+            refLin = refCoef * refLin + (1.0f - refCoef) * env;
+
+        const float relDb = gainToDb (env / juce::jmax (refLin, 1.0e-9f));
+
+        float boostDb = 0.0f;
+        if (relDb < thresholdOffsetDb)
+        {
+            boostDb = juce::jmin ((thresholdOffsetDb - relDb) * slope, boostCap);
+
+            // Taper to nothing under the floor. Without it the stage does its
+            // deepest lifting on whatever is quietest, which is the room.
+            if (relDb < floorOffsetDb)
+                boostDb *= juce::jlimit (0.0f, 1.0f,
+                                         (relDb - (floorOffsetDb - fadeDb)) / fadeDb);
+
+            // Stand down wherever the gate is pulling down.
+            if (gateWeight != nullptr)
+                boostDb *= juce::jlimit (0.0f, 1.0f, gateWeight[i]);
+        }
+
+        const float target = dbToGain (boostDb);
+        const float gc = target > gain ? gainAtkCoef : gainRelCoef;
+        gain = gc * gain + (1.0f - gc) * target;
+
+        worst = juce::jmax (worst, gainToDb (gain));
+
+        for (int ch = 0; ch < numCh; ++ch)
+            buffer.setSample (ch, i, buffer.getSample (ch, i) * gain);
+    }
+
+    lastBoostDb = gainToDb (gain);
+    peakBoostDb = juce::jmax (peakBoostDb, worst);
 }
 
 //==============================================================================
@@ -781,6 +974,270 @@ void DeEsser::process (juce::AudioBuffer<float>& buffer)
 }
 
 //==============================================================================
+// AdaptiveToneMatch
+//==============================================================================
+void AdaptiveToneMatch::prepare (double sampleRate, int, int numChannels)
+{
+    sr = sampleRate;
+    channels = juce::jlimit (1, 2, numChannels);
+
+    ring.assign ((size_t) fftSize, 0.0f);
+    scratch.assign ((size_t) fftSize * 2, 0.0f);
+    powerAccum.assign ((size_t) fftSize / 2, 0.0f);
+
+    juce::dsp::ProcessSpec spec { sampleRate, 512, 1 };
+    for (int ch = 0; ch < 2; ++ch)
+        for (auto& f : filters[ch]) f.prepare (spec);
+
+    const float hopSeconds = (float) hopSize / (float) sampleRate;
+    // Measurement window ~2.5 s of speech. Long enough that a single loud
+    // syllable does not move the curve, short enough that the loop is not
+    // chasing a spectrum from ten seconds ago.
+    accumLeak = std::exp (-hopSeconds / 2.5f);
+    peakDecay = std::exp (-hopSeconds / 4.0f);
+    framesPerUpdate = juce::jmax (1, (int) (0.5f / hopSeconds));
+
+    reset();
+}
+
+void AdaptiveToneMatch::reset()
+{
+    std::fill (ring.begin(), ring.end(), 0.0f);
+    std::fill (powerAccum.begin(), powerAccum.end(), 0.0f);
+    ringPos = sinceHop = framesSeen = framesSinceUpdate = 0;
+    progPeak = 0.0f;
+    updates = 0;
+    maxTrimDb = 0.0f;
+    gainDb = base;
+    for (int ch = 0; ch < 2; ++ch)
+        for (auto& f : filters[ch]) f.reset();
+    applyGains();
+}
+
+void AdaptiveToneMatch::setBase (const std::array<float, numToneBands>& baseDb, float amount)
+{
+    const float amt = juce::jlimit (0.0f, 2.0f, amount);
+    std::array<float, numToneBands> scaled {};
+    for (int b = 0; b < numToneBands; ++b) scaled[(size_t) b] = baseDb[(size_t) b] * amt;
+
+    // Re-seeding on every call would throw away the loop's work whenever a trim
+    // knob is nudged; only a real change to the static curve resets it.
+    bool changed = ! seeded;
+    for (int b = 0; b < numToneBands && ! changed; ++b)
+        changed = std::abs (scaled[(size_t) b] - base[(size_t) b]) > 0.05f;
+
+    base = scaled;
+    if (changed) { gainDb = base; seeded = true; }
+    applyGains();
+}
+
+void AdaptiveToneMatch::applyGains()
+{
+    for (int b = 0; b < numToneBands; ++b)
+    {
+        const float f0 = toneBandHz[(size_t) b];
+        const float g  = gainDb[(size_t) b];
+        active[(size_t) b] = std::abs (g) >= 0.15f && f0 >= 30.0f && f0 < sr * 0.45;
+        if (! active[(size_t) b]) continue;
+
+        // ArrayCoefficients returns by value, so no allocation happens here --
+        // this runs several times a second on the audio thread.
+        const auto c = juce::dsp::IIR::ArrayCoefficients<float>::makePeakFilter (
+                           sr, f0, qForBandwidth (1.0f / 3.0f), dbToGain (g));
+        for (int ch = 0; ch < channels; ++ch)
+            *filters[ch][(size_t) b].coefficients = c;
+    }
+}
+
+void AdaptiveToneMatch::process (juce::AudioBuffer<float>& buffer)
+{
+    const int numCh = juce::jmin (channels, buffer.getNumChannels());
+    const int n = buffer.getNumSamples();
+    if (numCh <= 0 || n <= 0) return;
+
+    for (int ch = 0; ch < numCh; ++ch)
+    {
+        auto* d = buffer.getWritePointer (ch);
+        for (int b = 0; b < numToneBands; ++b)
+        {
+            if (! active[(size_t) b]) continue;
+            auto& f = filters[ch][(size_t) b];
+            for (int i = 0; i < n; ++i) d[i] = f.processSample (d[i]);
+        }
+    }
+
+    // The loop measures the OUTPUT. Measuring the input instead would just
+    // reproduce the open-loop curve with extra steps.
+    pushAnalysis (buffer.getReadPointer (0), n);
+}
+
+void AdaptiveToneMatch::pushAnalysis (const float* x, int n)
+{
+    for (int i = 0; i < n; ++i)
+    {
+        ring[(size_t) ringPos] = x[i];
+        ringPos = (ringPos + 1) % fftSize;
+
+        if (++sinceHop >= hopSize)
+        {
+            sinceHop = 0;
+            analyseFrame();
+        }
+    }
+}
+
+void AdaptiveToneMatch::analyseFrame()
+{
+    // unwrap the ring, oldest sample first
+    float framePeak = 0.0f;
+    for (int i = 0; i < fftSize; ++i)
+    {
+        const float v = ring[(size_t) ((ringPos + i) % fftSize)];
+        scratch[(size_t) i] = v;
+        framePeak = juce::jmax (framePeak, std::abs (v));
+    }
+    std::fill (scratch.begin() + fftSize, scratch.end(), 0.0f);
+
+    progPeak = juce::jmax (framePeak, progPeak * peakDecay);
+
+    // Same gate the offline measurement uses: frames more than 34 dB under the
+    // running peak are gaps, and averaging gaps into the spectrum pulls the
+    // whole curve toward the shape of the room.
+    if (framePeak < progPeak * 0.02f || framePeak < dbToGain (noiseFloorDb + 10.0f))
+        return;
+
+    win.multiplyWithWindowingTable (scratch.data(), (size_t) fftSize);
+    fft.performFrequencyOnlyForwardTransform (scratch.data());
+
+    for (int i = 0; i < fftSize / 2; ++i)
+    {
+        const float p = scratch[(size_t) i] * scratch[(size_t) i];
+        powerAccum[(size_t) i] = accumLeak * powerAccum[(size_t) i] + (1.0f - accumLeak) * p;
+    }
+
+    ++framesSeen;
+    if (++framesSinceUpdate >= framesPerUpdate && framesSeen >= framesPerUpdate * 3)
+    {
+        framesSinceUpdate = 0;
+        integrate();
+    }
+}
+
+void AdaptiveToneMatch::integrate()
+{
+    for (int b = 0; b < numToneBands; ++b)
+    {
+        const float fc = toneBandHz[(size_t) b];
+        const int lo = juce::jmax (1, (int) std::floor (fc / 1.122462f * fftSize / sr));
+        const int hi = juce::jmin ((int) powerAccum.size() - 1,
+                                   (int) std::ceil (fc * 1.122462f * fftSize / sr));
+        float sum = 0.0f; int cnt = 0;
+        for (int i = lo; i <= hi; ++i) { sum += powerAccum[(size_t) i]; ++cnt; }
+        measuredDb[(size_t) b] = (cnt > 0 && sum > 0.0f)
+                               ? 10.0f * std::log10 (sum / (float) cnt) : -120.0f;
+    }
+
+    float measRef = 0.0f, tgtRef = 0.0f; int refCount = 0;
+    for (int b = 0; b < numToneBands; ++b)
+    {
+        const float f = toneBandHz[(size_t) b];
+        if (f < 200.0f || f > 2000.0f) continue;
+        measRef += measuredDb[(size_t) b];
+        tgtRef  += kTargetLtasDb[(size_t) b];
+        ++refCount;
+    }
+    if (refCount <= 0) return;
+    measRef /= (float) refCount;
+    tgtRef  /= (float) refCount;
+
+    // Integrator gain. With a 2.5 s measurement lag and an update every half
+    // second there are five updates inside one lag; anything much above 0.08
+    // per update makes the loop ring instead of settle.
+    constexpr float k = 0.08f;
+    constexpr float slew = 0.5f;
+
+    for (int b = 0; b < numToneBands; ++b)
+    {
+        const float f = toneBandHz[(size_t) b];
+        // Under 100 Hz the high-pass owns the correction and this bank stays
+        // where the LISTEN pass put it. The target falls 6 dB per third-octave
+        // down there, which is steeper than a bank smoothed enough not to comb
+        // can synthesise; letting the loop try anyway produced a -14 dB notch at
+        // 63 Hz sitting next to a +0.5 dB bump at 50 Hz. A steep Butterworth is
+        // simply the right tool for a slope, and it does not ring.
+        if (f < 100.0f || f >= sr * 0.45) continue;
+
+        const float meas = measuredDb[(size_t) b] - measRef;
+        const float tgt  = kTargetLtasDb[(size_t) b] - tgtRef;
+        const float err  = tgt - meas;
+
+        gainDb[(size_t) b] += juce::jlimit (-slew, slew, k * err);
+
+        // Bounds, in the same asymmetric spirit as the static solve: a cut can
+        // only remove something measurably too loud, a boost lifts whatever
+        // else lives in the band.
+        const float maxBoost = f > 8000.0f ? 4.0f : 8.0f;
+        // Room to actually finish the job under 100 Hz, where nothing a lead
+        // vocal needs lives. Kept shallower below 40 Hz: a 1/3-octave peaking
+        // filter that deep at 25 Hz puts its poles close enough to the unit
+        // circle that single-precision state stops being trustworthy.
+        const float maxCut = f < 40.0f ? -20.0f : (f < 100.0f ? -26.0f : -12.0f);
+        gainDb[(size_t) b] = juce::jlimit (maxCut, maxBoost, gainDb[(size_t) b]);
+        // ...and never far from what the LISTEN pass decided, so a pathological
+        // loop cannot invent a curve of its own. Wider downward under 100 Hz:
+        // that is where the largest correction is genuinely needed and where
+        // over-cutting costs nothing, and the symmetric bound was leaving 5 dB
+        // of measured rumble in place because it ran out of authority.
+        const float slack = f < 100.0f ? 22.0f : 8.0f;
+        gainDb[(size_t) b] = juce::jlimit (base[(size_t) b] - slack,
+                                           base[(size_t) b] + 8.0f,
+                                           gainDb[(size_t) b]);
+
+    }
+
+    // Regularisation, and it is not optional.
+    //
+    // Neighbouring 1/3-octave filters overlap heavily, so a whole family of
+    // very different gain vectors produces almost the same response at the band
+    // centres. Nothing in the error term distinguishes between them, and an
+    // integrator left to itself walks off into the largest one: measured on
+    // real material it settled at +6.9 dB on 200 Hz against -5.8 dB on 315 Hz,
+    // which reads as a perfect match on a 1/3-octave meter and sounds like a
+    // comb filter. Smoothing across bands removes precisely that mode -- it is
+    // the highest spatial frequency the bank can express, and it is the one the
+    // error term never pushes back on. Any shape the target genuinely asks for
+    // is restored by the next update.
+    {
+        // Small pull back toward the static solve as well, so the loop stays
+        // anchored to something the LISTEN pass can vouch for.
+        constexpr float leak = 0.004f;
+
+        std::array<float, numToneBands> sm = gainDb;
+        for (int b = 0; b < numToneBands; ++b)
+        {
+            const int a = juce::jmax (0, b - 1);
+            const int c = juce::jmin (numToneBands - 1, b + 1);
+            const float avg = 0.25f * gainDb[(size_t) a]
+                            + 0.50f * gainDb[(size_t) b]
+                            + 0.25f * gainDb[(size_t) c];
+
+            constexpr float smooth = 0.12f;
+            sm[(size_t) b] = gainDb[(size_t) b] + smooth * (avg - gainDb[(size_t) b])
+                                                + leak   * (base[(size_t) b] - gainDb[(size_t) b]);
+        }
+        gainDb = sm;
+    }
+
+    maxTrimDb = 0.0f;
+    for (int b = 0; b < numToneBands; ++b)
+        maxTrimDb = juce::jmax (maxTrimDb,
+                                std::abs (gainDb[(size_t) b] - base[(size_t) b]));
+
+    ++updates;
+    applyGains();
+}
+
+//==============================================================================
 // CleanupChain
 //==============================================================================
 void CleanupChain::prepare (double sampleRate, int maxBlockSize, int numChannels)
@@ -799,11 +1256,15 @@ void CleanupChain::prepare (double sampleRate, int maxBlockSize, int numChannels
     {
         hpf[ch].prepare (spec);
         hpf2[ch].prepare (spec);
+        hpf3[ch].prepare (spec);
         spectral[ch].prepare (sampleRate);
         for (auto& f : surgical[ch])  f.prepare ({ sampleRate, (juce::uint32) maxBlock, 1 });
-        for (auto& f : toneBands[ch]) f.prepare ({ sampleRate, (juce::uint32) maxBlock, 1 });
     }
 
+    tone.prepare (sampleRate, maxBlock, channels);
+
+    upward.prepare (sampleRate, channels);
+    gateTrace.assign ((size_t) maxBlock, 1.0f);
     comp.prepare (sampleRate, channels);
     deEss.prepare (sampleRate, maxBlock, channels);
 
@@ -819,12 +1280,14 @@ void CleanupChain::reset()
     {
         hpf[ch].reset();
         hpf2[ch].reset();
+        hpf3[ch].reset();
         spectral[ch].reset();
         for (auto& f : surgical[ch])  f.reset();
-        for (auto& f : toneBands[ch]) f.reset();
     }
+    tone.reset();
     deClip.reset();
     plosive.reset();
+    upward.reset();
     comp.reset();
     deEss.reset();
     limiter.reset();
@@ -862,16 +1325,15 @@ void CleanupChain::updateFilters()
     const float eqAmt = juce::jlimit (0.0f, 2.0f, trims.eqAmount);
     const float clAmt = juce::jlimit (0.0f, 2.0f, trims.cleanupAmount);
 
-    // A 1/3-octave band: the filters must be this narrow or 31 of them stack
-    // into a curve several times deeper than the one we measured.
-    const float toneQ = qForBandwidth (1.0f / 3.0f);
-
     for (int ch = 0; ch < channels; ++ch)
     {
+        // Butterworth section Qs for sixth order: 0.5176, 0.7071, 1.9319.
         *hpf[ch].coefficients =
-            *juce::dsp::IIR::Coefficients<float>::makeHighPass (sr, analysis.highPassHz, 0.541f);
+            *juce::dsp::IIR::Coefficients<float>::makeHighPass (sr, analysis.highPassHz, 0.5176f);
         *hpf2[ch].coefficients =
-            *juce::dsp::IIR::Coefficients<float>::makeHighPass (sr, analysis.highPassHz, 1.307f);
+            *juce::dsp::IIR::Coefficients<float>::makeHighPass (sr, analysis.highPassHz, 0.7071f);
+        *hpf3[ch].coefficients =
+            *juce::dsp::IIR::Coefficients<float>::makeHighPass (sr, analysis.highPassHz, 1.9319f);
 
         // Fixed-size arrays with a live count: updateFilters can be reached
         // from the audio thread when a trim knob moves, so it must not allocate.
@@ -885,25 +1347,6 @@ void CleanupChain::updateFilters()
             ++numSurgical;
         }
 
-        numTone = 0;
-        for (int b = 0; b < numToneBands; ++b)
-        {
-            // Use the solved gains, not the raw target: neighbouring 1/3-octave
-            // filters overlap, so the two differ by several dB.
-            // Pick the solve that matches whether the notches are actually in
-            // circuit; the two differ by several dB around each notch.
-            const float g = (bypass.surgicalEq ? analysis.toneFilterGainDbNoNotch
-                                               : analysis.toneFilterGainDb)[(size_t) b] * eqAmt;
-            if (std::abs (g) < 0.2f) continue;
-            const float f0 = toneBandHz[(size_t) b];
-            if (f0 < 30.0f || f0 > sr * 0.45) continue;
-
-            *toneBands[ch][(size_t) numTone].coefficients =
-                *juce::dsp::IIR::Coefficients<float>::makePeakFilter (
-                     sr, f0, toneQ, dbToGain (g));
-            ++numTone;
-        }
-
         spectral[ch].setDenoiseAmount (bypass.deNoise ? 0.0f : analysis.denoiseAmount * clAmt);
         spectral[ch].setDeverbAmount  (bypass.deVerb  ? 0.0f : analysis.deverbAmount  * clAmt);
         spectral[ch].setDeverbDecay   (analysis.rt60Seconds);
@@ -912,17 +1355,21 @@ void CleanupChain::updateFilters()
         spectral[ch].setResonanceDepth (bypass.resonance ? 0.0f : 0.55f * eqAmt);
     }
 
-    // The guard's corner follows the voice: cutting at a fixed 150 Hz would
-    // reach into the chest register of a low male voice.
-    // Sit the split below the fundamental: plosive energy peaks well under it,
-    // and crossing over on top of the voice makes the two indistinguishable.
-    plosive.setCornerHz (juce::jlimit (80.0f, 160.0f,
-                                       analysis.medianF0Hz > 60.0f
-                                           ? analysis.medianF0Hz * 0.75f : 120.0f));
+    // Bands and depth are measured, not guessed -- see VocalAnalyzer's plosive
+    // pass, which runs this exact detector over the capture.
+    plosive.setParams (analysis);
     plosive.setAmount (bypass.plosive ? 0.0f : trims.cleanupAmount);
 
+    upward.setParams (analysis, bypass.upward ? 0.0f : trims.compAmount);
     comp.setParams  (analysis, bypass.compressor ? 0.0f : trims.compAmount);
     deEss.setParams (analysis, bypass.deEss ? 0.0f : trims.deEssAmount);
+
+    // Pick the solve that matches whether the notches are actually in circuit:
+    // their skirts reach into neighbouring bands, so a curve solved around them
+    // is wrong the moment they are switched off.
+    tone.setBase (bypass.surgicalEq ? analysis.toneFilterGainDbNoNotch
+                                    : analysis.toneFilterGainDb, eqAmt);
+    tone.setNoiseFloorDb (analysis.noiseFloorDb);
 
     gateOpenLin     = dbToGain (analysis.gateThresholdDb);
     gateCloseLin    = dbToGain (analysis.gateThresholdDb - 6.0f);   // 6 dB hysteresis
@@ -973,7 +1420,8 @@ void CleanupChain::process (juce::AudioBuffer<float>& buffer)
         {
             auto* d = buffer.getWritePointer (ch);
             for (int i = 0; i < numSamples; ++i)
-                d[i] = hpf2[ch].processSample (hpf[ch].processSample (d[i]));
+                d[i] = hpf3[ch].processSample (
+                           hpf2[ch].processSample (hpf[ch].processSample (d[i])));
         }
 
     // 2. de-noise + de-verb + resonance suppression, sharing one STFT
@@ -1023,13 +1471,23 @@ void CleanupChain::process (juce::AudioBuffer<float>& buffer)
             const float coef = target > gateEnv ? gateAttackCoef : gateReleaseCoef;
             gateEnv = coef * gateEnv + (1.0f - coef) * target;
 
+            gateTrace[(size_t) i] = gateEnv;
+
             for (int ch = 0; ch < numCh; ++ch)
                 buffer.setSample (ch, i, buffer.getSample (ch, i) * gateEnv);
         }
         gateGain = gateEnv;
     }
+    else
+    {
+        std::fill (gateTrace.begin(), gateTrace.begin() + numSamples, 1.0f);
+    }
 
-    // 4. surgical notches
+    // 4. upward expansion: lift the quiet delivery toward the take average
+    if (! bypass.upward)
+        upward.process (buffer, gateTrace.data());
+
+    // 5. surgical notches
     if (! bypass.surgicalEq)
         for (int ch = 0; ch < numCh; ++ch)
         {
@@ -1039,23 +1497,17 @@ void CleanupChain::process (juce::AudioBuffer<float>& buffer)
                     d[i] = surgical[ch][(size_t) k].processSample (d[i]);
         }
 
-    // 5. two-stage compression
+    // 6. two-stage compression
     if (! bypass.compressor)
         comp.process (buffer);
 
-    // 6. de-ess AFTER compression, BEFORE the tone stage's additive HF
+    // 7. de-ess AFTER compression, BEFORE the tone stage's additive HF
     if (! bypass.deEss)
         deEss.process (buffer);
 
-    // 7. tone match to the universal target curve
+    // 8. tone match to the universal target curve, closed loop
     if (! bypass.toneMatch)
-        for (int ch = 0; ch < numCh; ++ch)
-        {
-            auto* d = buffer.getWritePointer (ch);
-            for (int k = 0; k < numTone; ++k)
-                for (int i = 0; i < numSamples; ++i)
-                    d[i] = toneBands[ch][(size_t) k].processSample (d[i]);
-        }
+        tone.process (buffer);
 
     // 9. safety limiter
     if (! bypass.limiter)
